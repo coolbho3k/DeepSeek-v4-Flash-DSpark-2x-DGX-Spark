@@ -374,6 +374,149 @@ def qnorm_rope_store_swa_nvfp4_416(
 
 
 @triton.jit
+def _rope_store_swa_nvfp4_416_kernel(
+    kv_ptr,
+    kv_stride0,
+    cache_ptr,
+    cache_block_stride,
+    slots_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    cos_sin_stride0,
+    cos_sin_stride1,
+    cache_block_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    fp4_data_bytes: tl.constexpr,
+    scale_group_size: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    record_bytes: tl.constexpr,
+):
+    """KV-only variant for DSpark's context-cache precompute path."""
+    row = tl.program_id(0)
+    slot = tl.load(slots_ptr + row)
+    if slot < 0:
+        return
+
+    dims = tl.arange(0, head_dim)
+    position = tl.load(positions_ptr + row)
+    rope_dims = dims - nope_dim
+    pair = tl.maximum(rope_dims // 2, 0)
+    cos = tl.load(
+        cos_sin_ptr + position.to(tl.int64) * cos_sin_stride0 + pair * cos_sin_stride1
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_ptr
+        + position.to(tl.int64) * cos_sin_stride0
+        + (rope_dim // 2 + pair) * cos_sin_stride1
+    ).to(tl.float32)
+    even_dim = nope_dim + pair * 2
+    odd_dim = even_dim + 1
+    kv_values = tl.load(kv_ptr + row * kv_stride0 + dims).to(tl.float32)
+    kv_even = tl.load(kv_ptr + row * kv_stride0 + even_dim).to(tl.float32)
+    kv_odd = tl.load(kv_ptr + row * kv_stride0 + odd_dim).to(tl.float32)
+    kv_rope = tl.where(
+        (rope_dims & 1) == 0,
+        kv_even * cos - kv_odd * sin,
+        kv_odd * cos + kv_even * sin,
+    )
+    kv_rotated = tl.where(dims < nope_dim, kv_values, kv_rope)
+    kv_rotated = kv_rotated.to(tl.bfloat16).to(tl.float32)
+
+    grouped = tl.reshape(kv_rotated, (scale_bytes, scale_group_size))
+    amax = tl.max(tl.abs(grouped), axis=1)
+    scale_fp8 = (amax * (1.0 / 6.0)).to(tl.float8e4nv)
+    rounded_scale = scale_fp8.to(tl.float32)
+    inv_scale = tl.where(
+        (amax != 0.0) & (rounded_scale != 0.0),
+        1.0 / rounded_scale,
+        0.0,
+    )
+    scaled = grouped * tl.reshape(inv_scale, (scale_bytes, 1))
+    pairs = tl.reshape(tl.reshape(scaled, (head_dim,)), (fp4_data_bytes, 2))
+    lo, hi = tl.split(pairs)
+    packed = _fp32x2_to_fp4x2(lo, hi)
+
+    block = slot // cache_block_size
+    token = slot % cache_block_size
+    record = (
+        cache_ptr
+        + block.to(tl.int64) * cache_block_stride
+        + token * record_bytes
+    )
+    tl.store(record + tl.arange(0, fp4_data_bytes), packed)
+    tl.store(
+        record + fp4_data_bytes + tl.arange(0, scale_bytes),
+        scale_fp8.to(tl.uint8, bitcast=True),
+    )
+
+    rope_out = (record + fp4_data_bytes + scale_bytes).to(
+        tl.pointer_type(tl.bfloat16)
+    )
+    rope_offsets = tl.arange(0, rope_dim)
+    rope_pairs = rope_offsets // 2
+    rope_cos = tl.load(
+        cos_sin_ptr
+        + position.to(tl.int64) * cos_sin_stride0
+        + rope_pairs * cos_sin_stride1
+    ).to(tl.float32)
+    rope_sin = tl.load(
+        cos_sin_ptr
+        + position.to(tl.int64) * cos_sin_stride0
+        + (rope_dim // 2 + rope_pairs) * cos_sin_stride1
+    ).to(tl.float32)
+    rope_even = tl.load(
+        kv_ptr + row * kv_stride0 + nope_dim + rope_pairs * 2
+    ).to(tl.float32)
+    rope_odd = tl.load(
+        kv_ptr + row * kv_stride0 + nope_dim + rope_pairs * 2 + 1
+    ).to(tl.float32)
+    rope_store = tl.where(
+        (rope_offsets & 1) == 0,
+        rope_even * rope_cos - rope_odd * rope_sin,
+        rope_odd * rope_cos + rope_even * rope_sin,
+    )
+    tl.store(rope_out + rope_offsets, rope_store.to(tl.bfloat16))
+
+
+def rope_store_swa_nvfp4_416(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    cache_block_size: int,
+) -> None:
+    """Rotate and store DSpark context KV without dummy-query work."""
+    if kv.ndim != 2 or kv.shape[-1] != HEAD_DIM:
+        raise ValueError(f"kv must be [N, {HEAD_DIM}], got {tuple(kv.shape)}")
+    if cache.ndim != 3 or cache.shape[-1] != RECORD_BYTES:
+        raise ValueError(f"cache must contain {RECORD_BYTES}-byte records")
+    _rope_store_swa_nvfp4_416_kernel[(kv.shape[0],)](
+        kv,
+        kv.stride(0),
+        cache,
+        cache.stride(0),
+        slots,
+        positions,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        cos_sin_cache.stride(1),
+        cache_block_size=cache_block_size,
+        head_dim=HEAD_DIM,
+        nope_dim=NOPE_DIM,
+        rope_dim=ROPE_DIM,
+        fp4_data_bytes=FP4_DATA_BYTES,
+        scale_group_size=SCALE_GROUP_SIZE,
+        scale_bytes=SCALE_BYTES,
+        record_bytes=RECORD_BYTES,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _norm_rope_store_nvfp4_416_kernel(
     values_ptr,
     values_stride0,
@@ -624,6 +767,165 @@ def _compress_kv_c4_nvfp4_416_kernel(
     )
 
 
+@triton.jit
+def _compress_norm_rope_store_c4_nvfp4_416_kernel(
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    state_slots_ptr,
+    block_table_ptr,
+    block_table_stride0,
+    norm_weight_ptr,
+    cos_sin_ptr,
+    cos_sin_stride0,
+    cos_sin_stride1,
+    cache_ptr,
+    cache_block_stride,
+    kv_slots_ptr,
+    rms_norm_eps,
+    state_block_size,
+    cache_block_size: tl.constexpr,
+    state_width: tl.constexpr,
+    head_dim: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    fp4_data_bytes: tl.constexpr,
+    scale_group_size: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    record_bytes: tl.constexpr,
+):
+    """Fuse the dominant C4 prefill path into one cache-writing kernel."""
+    row = tl.program_id(0)
+    position = tl.load(positions_ptr + row)
+    state_slot = tl.load(state_slots_ptr + row)
+    kv_slot = tl.load(kv_slots_ptr + row)
+    if (
+        state_slot < 0
+        or kv_slot < 0
+        or (position + 1) % compress_ratio != 0
+    ):
+        return
+
+    request = tl.load(token_to_req_indices_ptr + row)
+    dims = tl.arange(0, head_dim)
+    running_max = tl.full((head_dim,), -float("inf"), tl.float32)
+    running_sum = tl.zeros((head_dim,), tl.float32)
+    running_product = tl.zeros((head_dim,), tl.float32)
+    start = position - (2 * compress_ratio - 1)
+
+    for window_row in range(2 * compress_ratio):
+        logical = start + window_row
+        valid = logical >= 0
+        table_column = logical // state_block_size
+        physical = tl.load(
+            block_table_ptr + request * block_table_stride0 + table_column,
+            mask=valid,
+            other=0,
+        )
+        block_offset = logical % state_block_size
+        segment = (window_row // compress_ratio) * head_dim
+        state_row = (
+            state_cache_ptr
+            + physical.to(tl.int64) * state_cache_stride0
+            + block_offset * state_cache_stride1
+            + segment
+        )
+        values = tl.load(state_row + dims, mask=valid, other=0.0).to(
+            tl.float32
+        )
+        scores = tl.load(
+            state_row + state_width + dims,
+            mask=valid,
+            other=-float("inf"),
+        ).to(tl.float32)
+
+        new_max = tl.maximum(running_max, scores)
+        old_scale = tl.where(
+            running_max == -float("inf"),
+            0.0,
+            tl.exp2((running_max - new_max) * 1.4426950408889634),
+        )
+        new_scale = tl.where(
+            valid,
+            tl.exp2((scores - new_max) * 1.4426950408889634),
+            0.0,
+        )
+        running_sum = running_sum * old_scale + new_scale
+        running_product = running_product * old_scale + values * new_scale
+        running_max = new_max
+
+    compressed = running_product / running_sum
+    inv_rms = tl.rsqrt(
+        tl.sum(compressed * compressed, axis=0) / head_dim + rms_norm_eps
+    )
+    normalized = (
+        compressed
+        * inv_rms
+        * tl.load(norm_weight_ptr + dims).to(tl.float32)
+    )
+
+    compressed_position = (position // compress_ratio) * compress_ratio
+    rope_dims = dims - nope_dim
+    pair = tl.maximum(rope_dims // 2, 0)
+    cos = tl.load(
+        cos_sin_ptr
+        + compressed_position.to(tl.int64) * cos_sin_stride0
+        + pair * cos_sin_stride1
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_ptr
+        + compressed_position.to(tl.int64) * cos_sin_stride0
+        + (rope_dim // 2 + pair) * cos_sin_stride1
+    ).to(tl.float32)
+    even_dim = nope_dim + pair * 2
+    odd_dim = even_dim + 1
+    even = tl.gather(normalized, even_dim, axis=0)
+    odd = tl.gather(normalized, odd_dim, axis=0)
+    rope = tl.where(
+        (rope_dims & 1) == 0,
+        even * cos - odd * sin,
+        odd * cos + even * sin,
+    )
+    rotated = tl.where(dims < nope_dim, normalized, rope)
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    grouped = tl.reshape(rotated, (scale_bytes, scale_group_size))
+    amax = tl.max(tl.abs(grouped), axis=1)
+    scale_fp8 = (amax * (1.0 / 6.0)).to(tl.float8e4nv)
+    rounded_scale = scale_fp8.to(tl.float32)
+    inv_scale = tl.where(
+        (amax != 0.0) & (rounded_scale != 0.0),
+        1.0 / rounded_scale,
+        0.0,
+    )
+    scaled = grouped * tl.reshape(inv_scale, (scale_bytes, 1))
+    pairs = tl.reshape(tl.reshape(scaled, (head_dim,)), (fp4_data_bytes, 2))
+    lo, hi = tl.split(pairs)
+    packed = _fp32x2_to_fp4x2(lo, hi)
+
+    block = kv_slot // cache_block_size
+    token = kv_slot % cache_block_size
+    record = (
+        cache_ptr
+        + block.to(tl.int64) * cache_block_stride
+        + token * record_bytes
+    )
+    tl.store(record + tl.arange(0, fp4_data_bytes), packed)
+    tl.store(
+        record + fp4_data_bytes + tl.arange(0, scale_bytes),
+        scale_fp8.to(tl.uint8, bitcast=True),
+    )
+    rope_out = (record + fp4_data_bytes + scale_bytes).to(
+        tl.pointer_type(tl.bfloat16)
+    )
+    rope_offsets = tl.arange(0, rope_dim)
+    rope_values = tl.gather(rotated, nope_dim + rope_offsets, axis=0)
+    tl.store(rope_out + rope_offsets, rope_values.to(tl.bfloat16))
+
+
 def compress_kv_nvfp4_416(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -738,6 +1040,41 @@ def compress_norm_rope_store_nvfp4_416(
     del pdl_kwargs, quant_block, token_stride, scale_dim
     if not use_fp4_cache or head_dim != HEAD_DIM or rope_head_dim != ROPE_DIM:
         raise ValueError("the 416-byte writer requires the DSV4 512/64 FP4 contract")
+
+    if compress_ratio == 4:
+        if not overlap or state_width != 2 * HEAD_DIM:
+            raise ValueError("the C4A compressor requires overlap and state_width=1024")
+        _compress_norm_rope_store_c4_nvfp4_416_kernel[(num_actual,)](
+            state_cache,
+            state_cache.stride(0),
+            state_cache.stride(1),
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_table.stride(0),
+            rms_norm_weight,
+            cos_sin_cache,
+            cos_sin_cache.stride(0),
+            cos_sin_cache.stride(1),
+            kv_cache,
+            kv_cache.stride(0),
+            k_cache_metadata.slot_mapping,
+            rms_norm_eps,
+            block_size,
+            cache_block_size=kv_cache.shape[1],
+            state_width=state_width,
+            head_dim=HEAD_DIM,
+            nope_dim=NOPE_DIM,
+            rope_dim=ROPE_DIM,
+            compress_ratio=4,
+            fp4_data_bytes=FP4_DATA_BYTES,
+            scale_group_size=SCALE_GROUP_SIZE,
+            scale_bytes=SCALE_BYTES,
+            record_bytes=RECORD_BYTES,
+            num_warps=8,
+        )
+        return
 
     compressed = torch.empty(
         (num_actual, HEAD_DIM), dtype=torch.float32, device=state_cache.device

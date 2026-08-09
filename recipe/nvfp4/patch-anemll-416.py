@@ -121,7 +121,13 @@ replace(
 # drafter's context cache and collapsing target/draft agreement.
 replace(
     "models/deepseek_v4/nvidia/dspark.py",
-    '''    if cache_dtype == torch.uint8:
+    '''    n_ctx = kv.shape[0]
+    dummy_q = torch.zeros(
+        (n_ctx, attn.n_local_heads, attn.head_dim),
+        dtype=kv.dtype,
+        device=kv.device,
+    )
+    if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -136,23 +142,26 @@ replace(
             block_size,
         )
 ''',
-    '''    if cache_dtype == torch.uint8:
-        if attn.kv_cache_dtype == "nvfp4_ds_mla":
-            from .nvfp4_cache import qnorm_rope_store_swa_nvfp4_416
+    '''    n_ctx = kv.shape[0]
+    if cache_dtype == torch.uint8 and attn.kv_cache_dtype == "nvfp4_ds_mla":
+        from .nvfp4_cache import rope_store_swa_nvfp4_416
 
-            qnorm_rope_store_swa_nvfp4_416(
-                dummy_q,
-                kv,
-                swa_cache,
-                slot_mapping,
-                positions,
-                cos_sin_cache,
-                padded_heads=attn.padded_heads,
-                rms_norm_eps=attn.eps,
-                cache_block_size=block_size,
-            )
-            return
+        rope_store_swa_nvfp4_416(
+            kv,
+            swa_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            cache_block_size=block_size,
+        )
+        return
 
+    dummy_q = torch.zeros(
+        (n_ctx, attn.n_local_heads, attn.head_dim),
+        dtype=kv.dtype,
+        device=kv.device,
+    )
+    if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(

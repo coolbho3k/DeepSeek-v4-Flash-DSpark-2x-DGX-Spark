@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import torch
 
@@ -14,12 +15,14 @@ from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
     RECORD_BYTES,
     ROPE_DIM,
     SCALE_BYTES,
+    compress_norm_rope_store_nvfp4_416,
     compress_kv_nvfp4_416,
     dequantize_and_gather_nvfp4_416,
     insert_nvfp4_416,
     norm_rope_store_nvfp4_416,
     pack_reference,
     qnorm_rope_store_swa_nvfp4_416,
+    rope_store_swa_nvfp4_416,
     sparse_attention_nvfp4_416,
     unpack_reference,
 )
@@ -146,6 +149,7 @@ def gpu_kernel_test() -> None:
     block_table = torch.tensor(
         [[2, 0, 4, 1, 3]], dtype=torch.int32, device=device
     )
+    c4_block_table = block_table
     state_cache = torch.randn(
         (5, state_block_size, 2 * state_width),
         generator=generator,
@@ -201,6 +205,60 @@ def gpu_kernel_test() -> None:
         atol=2e-5,
     )
     print("gpu C4 compression-only fallback: ok")
+
+    # The serving C4 path fuses compression, weighted RMSNorm, RoPE, FP4
+    # packing, and cache insertion. It must remain byte-identical to the
+    # independently validated two-stage kernels.
+    c4_norm_weight = torch.randn(
+        (HEAD_DIM,), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    c4_angles = torch.randn(
+        (16, ROPE_DIM // 2), generator=generator, device=device
+    )
+    c4_cos_sin_cache = torch.cat((c4_angles.cos(), c4_angles.sin()), dim=-1)
+    c4_reference_cache = torch.full(
+        (1, 64, RECORD_BYTES), 0xA5, dtype=torch.uint8, device=device
+    )
+    norm_rope_store_nvfp4_416(
+        compressed,
+        compression_positions,
+        compression_slots,
+        c4_norm_weight,
+        c4_cos_sin_cache,
+        c4_reference_cache,
+        rms_norm_eps=1e-6,
+        cache_block_size=64,
+        compress_ratio=4,
+    )
+    c4_fused_cache = torch.full_like(c4_reference_cache, 0xA5)
+    c4_metadata = SimpleNamespace(slot_mapping=compression_slots)
+    compress_norm_rope_store_nvfp4_416(
+        state_cache=state_cache,
+        num_actual=compression_positions.shape[0],
+        token_to_req_indices=request_indices,
+        positions=compression_positions,
+        slot_mapping=compression_slots,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=state_width,
+        cos_sin_cache=c4_cos_sin_cache,
+        kv_cache=c4_fused_cache,
+        k_cache_metadata=c4_metadata,
+        pdl_kwargs={},
+        head_dim=HEAD_DIM,
+        rope_head_dim=ROPE_DIM,
+        compress_ratio=4,
+        overlap=True,
+        use_fp4_cache=True,
+        rms_norm_weight=c4_norm_weight,
+        rms_norm_eps=1e-6,
+        quant_block=16,
+        token_stride=RECORD_BYTES,
+        scale_dim=SCALE_BYTES,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c4_fused_cache, c4_reference_cache, rtol=0, atol=0)
+    print("gpu fused C4 compress/norm/rope/writer: ok")
 
     # Cross page boundaries and leave sentinel rows untouched.
     slots = torch.tensor([0, 63, 64, 65, 127, 128, 191, 192], device=device)
@@ -294,7 +352,17 @@ def gpu_kernel_test() -> None:
         rms_norm_eps=1e-6,
         cache_block_size=64,
     )
+    kv_only_cache = torch.full_like(cache, 0xA5)
+    rope_store_swa_nvfp4_416(
+        kv,
+        kv_only_cache,
+        slots,
+        positions,
+        cos_sin_cache,
+        cache_block_size=64,
+    )
     torch.cuda.synchronize()
+    torch.testing.assert_close(kv_only_cache, swa_cache, rtol=0, atol=0)
 
     cos = cos_sin_cache[:, : ROPE_DIM // 2]
     sin = cos_sin_cache[:, ROPE_DIM // 2 :]
@@ -335,7 +403,7 @@ def gpu_kernel_test() -> None:
         swa_restored[:, :NOPE_DIM] - kv_reference[:, :NOPE_DIM].float()
     ).abs().mean() < 0.09
     assert torch.all(swa_cache.view(-1, RECORD_BYTES)[untouched] == 0xA5)
-    print("gpu SWA qnorm/rope/writer: ok")
+    print("gpu SWA qnorm/rope and KV-only writers: ok")
 
     # Main-cache post-compression writer: weighted RMSNorm, compressed-position
     # RoPE, BF16 rounding, and NVFP4 record store are all one Triton launch.
@@ -550,7 +618,9 @@ def gpu_kernel_test() -> None:
     )
 
     graph_swa_cache = torch.full_like(cache, 0xA5)
+    graph_kv_only_cache = torch.full_like(cache, 0xA5)
     graph_main_cache = torch.full_like(cache, 0xA5)
+    graph_c4_cache = torch.full_like(c4_reference_cache, 0xA5)
     graph_output = torch.empty_like(q_attention)
     graph_mid_out = torch.empty_like(combined_mid_out)
     graph_mid_lse = torch.empty_like(combined_mid_lse)
@@ -568,6 +638,14 @@ def gpu_kernel_test() -> None:
             rms_norm_eps=1e-6,
             cache_block_size=64,
         )
+        rope_store_swa_nvfp4_416(
+            kv,
+            graph_kv_only_cache,
+            slots,
+            positions,
+            cos_sin_cache,
+            cache_block_size=64,
+        )
         norm_rope_store_nvfp4_416(
             main_values,
             main_positions,
@@ -578,6 +656,30 @@ def gpu_kernel_test() -> None:
             rms_norm_eps=1e-6,
             cache_block_size=64,
             compress_ratio=4,
+        )
+        compress_norm_rope_store_nvfp4_416(
+            state_cache=state_cache,
+            num_actual=compression_positions.shape[0],
+            token_to_req_indices=request_indices,
+            positions=compression_positions,
+            slot_mapping=compression_slots,
+            block_table=c4_block_table,
+            block_size=state_block_size,
+            state_width=state_width,
+            cos_sin_cache=c4_cos_sin_cache,
+            kv_cache=graph_c4_cache,
+            k_cache_metadata=c4_metadata,
+            pdl_kwargs={},
+            head_dim=HEAD_DIM,
+            rope_head_dim=ROPE_DIM,
+            compress_ratio=4,
+            overlap=True,
+            use_fp4_cache=True,
+            rms_norm_weight=c4_norm_weight,
+            rms_norm_eps=1e-6,
+            quant_block=16,
+            token_stride=RECORD_BYTES,
+            scale_dim=SCALE_BYTES,
         )
         sparse_attention_nvfp4_416(
             q=graph_q[:test_rows],
@@ -602,7 +704,9 @@ def gpu_kernel_test() -> None:
         graph_output, attention_reference(True), rtol=0.02, atol=0.015625
     )
     torch.testing.assert_close(graph_swa_cache, swa_cache, rtol=0, atol=0)
+    torch.testing.assert_close(graph_kv_only_cache, swa_cache, rtol=0, atol=0)
     torch.testing.assert_close(graph_main_cache, main_cache, rtol=0, atol=0)
+    torch.testing.assert_close(graph_c4_cache, c4_reference_cache, rtol=0, atol=0)
     print("gpu CUDA graph capture/replay (writers + attention): ok")
     print("gpu fused FP4 sparse attention (split + one-pass): ok")
 
