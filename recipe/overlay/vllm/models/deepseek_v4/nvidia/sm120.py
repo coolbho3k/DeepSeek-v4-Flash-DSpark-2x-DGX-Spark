@@ -339,6 +339,27 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         # Treat queries in the same seq as independent queries (attended
         # purely by the generated indices). q arrives pre-padded to
         # layer.padded_heads by the outer wrapper.
+        if layer.swa_cache_layer.kv_cache.shape[-1] == 416:
+            from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
+                sparse_decode_nvfp4_416_reference,
+            )
+
+            sparse_decode_nvfp4_416_reference(
+                q=q,
+                swa_cache=layer.swa_cache_layer.kv_cache,
+                swa_indices=swa_indices,
+                swa_lengths=swa_lens,
+                swa_page_size=swa_metadata.block_size,
+                indexed_cache=kv_cache,
+                indexed_indices=topk_indices,
+                indexed_lengths=topk_lens,
+                indexed_page_size=block_size if kv_cache is not None else None,
+                sm_scale=layer.scale,
+                attn_sink=layer.attn_sink,
+                output=output,
+            )
+            return
+
         if _use_b12x_compressed_mla():
             from b12x.attention.mla.compressed_api import (
                 compressed_mla_decode_forward,
@@ -503,17 +524,49 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     extra_topk,
                 )
 
-            layer._sparse_mla_wrapper.run(
-                q=q[query_start:query_end],
-                kv_cache=swa_kv_paged,
-                indices=swa_metadata.prefill_swa_indices[query_start:query_end],
-                output=output[query_start:query_end],
-                sm_scale=layer.scale,
-                topk_length=swa_metadata.prefill_swa_lens[query_start:query_end],
-                attn_sink=layer.attn_sink,
-                extra_kv_cache=extra_kv_paged,
-                extra_indices=extra_indices_chunk,
-                extra_topk_length=extra_topk_length_chunk,
-                mid_out=mid_out,
-                mid_lse=mid_lse,
-            )
+            if swa_k_cache.shape[-1] == 416:
+                from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
+                    sparse_decode_nvfp4_416_reference,
+                )
+
+                sparse_decode_nvfp4_416_reference(
+                    q=q[query_start:query_end],
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    swa_lengths=swa_metadata.prefill_swa_lens[
+                        query_start:query_end
+                    ],
+                    swa_page_size=swa_metadata.block_size,
+                    indexed_cache=compressed_k_cache,
+                    indexed_indices=extra_indices_chunk,
+                    indexed_lengths=extra_topk_length_chunk,
+                    indexed_page_size=(
+                        attn_metadata.block_size // layer.compress_ratio
+                        if compressed_k_cache is not None
+                        else None
+                    ),
+                    sm_scale=layer.scale,
+                    attn_sink=layer.attn_sink,
+                    output=output[query_start:query_end],
+                )
+            else:
+                layer._sparse_mla_wrapper.run(
+                    q=q[query_start:query_end],
+                    kv_cache=swa_kv_paged,
+                    indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    output=output[query_start:query_end],
+                    sm_scale=layer.scale,
+                    topk_length=swa_metadata.prefill_swa_lens[
+                        query_start:query_end
+                    ],
+                    attn_sink=layer.attn_sink,
+                    extra_kv_cache=extra_kv_paged,
+                    extra_indices=extra_indices_chunk,
+                    extra_topk_length=extra_topk_length_chunk,
+                    mid_out=mid_out,
+                    mid_lse=mid_lse,
+                )

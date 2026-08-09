@@ -47,6 +47,12 @@ overlay build. Stage-C recipes and overlay sources remain under `recipe/`.
 When using Stage-C, also merge `docker-compose.stage-c.override.yml` and enable
 the Stage-C env block in `.env.dspark` (see [`docs/ENVS.md`](docs/ENVS.md)).
 
+The true 416-byte Stage-D cache is available on this feature branch. Build it
+on both nodes with `DSPARK_BUILD_STAGE=stage-d-416` and use
+`DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental`. Its
+correctness-first attention bridge currently requires `ENFORCE_EAGER=1`,
+`MOE_BACKEND=b12x`, and `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`.
+
 This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
 sources for local image builds and documentation. With the Anemll image, that
 logic ships inside the image rather than as a host bind-mount.
@@ -600,15 +606,17 @@ This keeps NVFP4 KV and MTP5. Do not switch to fp8 or drop to a smaller fallback
 model just to hide the symptom unless you intentionally accept the context and
 quality tradeoff.
 
-## Important Caveat
+## Stage-D 416-byte cache status
 
-> [!CAUTION]
-> This is the **Stage C padded NVFP4** path. It keeps DeepSeek V4's known-good
-> 584-byte sparse-MLA cache envelope while routing the runtime through
-> `nvfp4_ds_mla`. It is **not** the unresolved true-layout 416-byte NVFP4 kernel
-> fix. The true-layout experiments were useful for diagnosis but failed past
-> roughly 411 real prompt tokens, so they are intentionally not presented here
-> as the reproducible recipe.
+> [!NOTE]
+> Stage D uses the true per-token layout: 256 bytes of packed E2M1 data,
+> 32 bytes of E4M3 scales, and 128 bytes of authoritative BF16 RoPE. On two DGX
+> Sparks it booted with `MAX_MODEL_LEN=1048576` and
+> `GPU_MEMORY_UTILIZATION=0.835`, allocated a 3,082,065-token GPU KV pool
+> (2.94x concurrency at 1M), and completed a 1,642-token chat-prefill test plus
+> decode with clean logs on both ranks. The reference attention bridge favors
+> correctness over throughput and runs eager; benchmark it before replacing a
+> performance-sensitive Stage-C or Anemll deployment.
 
 ## Credits
 
@@ -668,7 +676,7 @@ usage terms.
 | `.env.dspark.example` | sanitized cluster template; default image Anemll `0.1.1`, **0731** / **1M** context |
 | [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) | 0731 checkpoint, encoder notes, sweep method, and measured results |
 | [`docs/benchmarks.png`](docs/benchmarks.png) | official 0731 decode-benchmark capture (2048 tok, concurrency sweep) |
-| [`docs/ENVS.md`](docs/ENVS.md) | Anemll vs Stage-C env registry matrix (unknown-`VLLM_*` warnings) |
+| [`docs/ENVS.md`](docs/ENVS.md) | Anemll vs Stage-C/Stage-D env registry matrix (unknown-`VLLM_*` warnings) |
 | `docker-compose.stage-c.override.yml` | optional Stage-C-only env injection |
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; image must exist on both nodes |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
@@ -679,10 +687,12 @@ usage terms.
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
 | `scripts/benchmark-0731.py` | streaming concurrency/prefill sweep for the 0731 endpoint |
 | `results/deepseek-v4-flash-0731-2x-dgx-spark.json` | published two-Spark 0731 sweep measurements |
-| `build-dspark-vllm-runtime.sh` | optional Stage-C local image build (not required for Anemll) |
+| `build-dspark-vllm-runtime.sh` | optional Stage-C or true-416-byte Stage-D image build (not required for Anemll) |
 | `recipe/overlay/` | Stage-C DSpark vLLM overlay sources for local image builds |
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
-| `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C NVFP4 image layers for local builds |
+| `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C/D NVFP4 image layers for local builds |
+| `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | true 416-byte writer, gather, and correctness-first attention bridge |
+| `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
 | `vllm_patch_gb10/` | optional experimental GB10 hybrid NVFP4 vLLM plugin |
 | `docs/PATCHES.md` | plain-English Patch 1 / Patch 2 / Patch 2b concurrency explanation |
@@ -701,9 +711,9 @@ Edit these values for your cluster:
 - `WORKER_HOST`
 - `WORKER_SCRIPT_DIR` if the worker checkout/deployment path differs from the head
 - `MASTER_ADDR`
-- `NCCL_IB_HCA`
+- `NCCL_IB_HCA` and `WORKER_NCCL_IB_HCA` (comma-separated to use multiple rails)
 - `NCCL_SOCKET_IFNAME` (and matching `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`, or leave those unset so compose inherits the NCCL IF)
-- `NCCL_IB_GID_INDEX` (not always 0 — match your RoCE GID)
+- `NCCL_IB_GID_AUTO=1` (the launcher resolves a valid per-node RoCEv2 GID across the HCA list)
 - `HF_CACHE`
 - `WORKER_HF_CACHE` if the worker cache path differs from the head
 - `VLLM_HOST_IP` and `WORKER_VLLM_HOST_IP` for each node's fabric IP
@@ -716,7 +726,9 @@ MASTER_ADDR=10.0.0.1
 VLLM_HOST_IP=10.0.0.1
 WORKER_VLLM_HOST_IP=10.0.0.2
 MASTER_PORT=25000
-NCCL_IB_HCA=rocep1s0f1
+NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
+WORKER_NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
+NCCL_IB_GID_AUTO=1
 NCCL_SOCKET_IFNAME=enp1s0f1np1
 TP_SOCKET_IFNAME=enp1s0f1np1
 GLOO_SOCKET_IFNAME=enp1s0f1np1
@@ -755,6 +767,17 @@ Optional: build the historical Stage-C image instead:
 # then set DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-stage-c
 # and IMAGE_PYTHON=/opt/env/bin/python for prepare-dspark-model-cache.sh
 ```
+
+Build the true 416-byte Stage-D image on both nodes:
+
+```bash
+DSPARK_BUILD_STAGE=stage-d-416 \
+DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental \
+./build-dspark-vllm-runtime.sh
+```
+
+For Stage D, keep `ENFORCE_EAGER=1`, `MOE_BACKEND=b12x`, and
+`DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc` in `.env.dspark`.
 
 Prepare the model cache on both nodes (or rsync a verified hub snapshot):
 

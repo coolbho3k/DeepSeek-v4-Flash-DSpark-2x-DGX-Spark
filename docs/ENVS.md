@@ -132,6 +132,17 @@ Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 - Enable the Stage-C override compose file and the Stage-C block in `.env.dspark.example`
 - Then the Keys-oriented switches (e.g. `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`) are meaningful
 
+### Stage-D `vllm-dspark-runtime:dspark-nvfp4-416-experimental`
+
+- Build with `DSPARK_BUILD_STAGE=stage-d-416 ./build-dspark-vllm-runtime.sh`
+- Set `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental`
+- Keep `MAX_MODEL_LEN=1048576`, `ENFORCE_EAGER=1`, `MOE_BACKEND=b12x`, and
+  `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`
+- The validated two-Spark profile uses `GPU_MEMORY_UTILIZATION=0.835`,
+  `MAX_NUM_SEQS=6`, and `MAX_NUM_BATCHED_TOKENS=8192`
+- Stage D uses the same Stage-C registry surface plus the true 416-byte
+  DeepSeek V4 NVFP4 writer/gather/reference-attention overlay
+
 ---
 
 ## What this does *not* claim

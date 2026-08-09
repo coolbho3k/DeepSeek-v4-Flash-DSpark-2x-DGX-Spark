@@ -196,25 +196,33 @@ iface_ipv4() {
   fi
 }
 
-# Resolve RoCEv2 GID index for HCA whose GID embeds match_ip.
-# $1=ssh target (empty=local)  $2=HCA  $3=IPv4 to match
+# Resolve RoCEv2 GID index for any HCA in NCCL's comma-separated include list
+# whose GID embeds match_ip.
+# $1=ssh target (empty=local)  $2=HCA list  $3=IPv4 to match
 resolve_rocev2_gid_index() {
-  local ssh_target="$1" hca="$2" match_ip="$3"
+  local ssh_target="$1" hca_list="$2" match_ip="$3"
   local hex remote
   hex="$(ipv4_to_gid_suffix "$match_ip")" || return 1
   remote=$(
     cat <<EOF
-hca=$(printf '%q' "$hca")
+hca_list=$(printf '%q' "$hca_list")
 hex=$(printf '%q' "$hex")
-for g in /sys/class/infiniband/\$hca/ports/1/gids/*; do
-  [ -e "\$g" ] || continue
-  i=\${g##*/}
-  t=\$(cat /sys/class/infiniband/\$hca/ports/1/gid_attrs/types/\$i 2>/dev/null || true)
-  [ "\$t" = "RoCE v2" ] || continue
-  case \$(cat "\$g" 2>/dev/null) in
-    *ffff:\${hex}) echo "\$i"; exit 0 ;;
-  esac
+old_ifs=\$IFS
+IFS=,
+for hca in \$hca_list; do
+  IFS=\$old_ifs
+  for g in /sys/class/infiniband/\$hca/ports/1/gids/*; do
+    [ -e "\$g" ] || continue
+    i=\${g##*/}
+    t=\$(cat /sys/class/infiniband/\$hca/ports/1/gid_attrs/types/\$i 2>/dev/null || true)
+    [ "\$t" = "RoCE v2" ] || continue
+    case \$(cat "\$g" 2>/dev/null) in
+      *ffff:\${hex}) echo "\$i"; exit 0 ;;
+    esac
+  done
+  IFS=,
 done
+IFS=\$old_ifs
 exit 1
 EOF
   )
@@ -499,7 +507,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "Running minimal OpenAI-compatible chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0}' >/dev/null
+      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0,"max_tokens":8,"chat_template_kwargs":{"thinking":false}}' >/dev/null
     echo "Minimal chat request succeeded."
     exit 0
   fi

@@ -1,0 +1,263 @@
+ARG BASE_IMAGE=vllm-dspark-runtime:dspark-nvfp4-stage-c
+FROM ${BASE_IMAGE}
+
+# Keep the validated Stage-C image unchanged. This layer switches only the
+# experimental image back to the true 416-byte record and wires matching
+# writer/gather/decode implementations.
+COPY recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py
+COPY recipe/overlay/vllm/models/deepseek_v4/nvidia/sm120.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/sm120.py
+COPY recipe/overlay/vllm/models/deepseek_v4/common/ops/cache_utils.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py
+
+# The repository's two-node compose launcher targets the Anemll image layout.
+# Expose the staged /opt/env installation at those paths only in this isolated
+# experimental image so the normal deployment remains unchanged.
+RUN ln -sf /opt/env/bin/vllm /usr/local/bin/vllm \
+    && ln -sf /opt/env/bin/python /usr/local/bin/python3 \
+    && ln -sf /opt/env/bin/ninja /usr/local/bin/ninja \
+    && ln -sf /opt/env/bin/aarch64-conda-linux-gnu-gcc /usr/local/bin/cc \
+    && ln -sf /opt/env/bin/aarch64-conda-linux-gnu-gcc /usr/local/bin/gcc \
+    && mkdir -p /usr/local/lib/python3.12/dist-packages \
+    && ln -s /opt/env/lib/python3.12/site-packages/vllm \
+        /usr/local/lib/python3.12/dist-packages/vllm
+
+RUN /opt/env/bin/python - <<'PY'
+from pathlib import Path
+
+root = Path("/opt/env/lib/python3.12/site-packages/vllm")
+
+
+def replace(path: str, old: str, new: str) -> None:
+    p = root / path
+    text = p.read_text()
+    if new in text:
+        return
+    if old not in text:
+        raise SystemExit(f"missing 416 patch anchor in {p}: {old!r}")
+    p.write_text(text.replace(old, new, 1))
+
+
+replace(
+    "models/deepseek_v4/attention.py",
+    '''        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            # Stage C: keep DeepSeek V4's proven 584-byte cache envelope so
+            # hybrid MLA/SWA grouping can proceed while testing nvfp4_ds_mla.
+            head_bytes = 584
+''',
+    '''        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            # True NVFP4: 256B packed E2M1 + 32B E4M3 scales + 128B BF16 RoPE.
+            head_bytes = 416
+''',
+)
+
+replace(
+    "models/deepseek_v4/attention.py",
+    '''                rotate=True,
+                prefix=f"{prefix}.compressor",
+                k_cache_prefix=self.mla_attn.prefix,
+            )
+''',
+    '''                rotate=True,
+                prefix=f"{prefix}.compressor",
+                k_cache_prefix=self.mla_attn.prefix,
+                use_fp4_cache=self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla",
+            )
+''',
+)
+
+replace(
+    "models/deepseek_v4/nvidia/flashmla.py",
+    '''        if cache_dtype_str == "nvfp4_ds_mla":
+            # Stage C: DeepSeek V4 padded NVFP4 probe. Match the fp8_ds_mla
+            # envelope first; if this boots, kernel/store correctness is next.
+            return (num_blocks, block_size, 584)
+''',
+    '''        if cache_dtype_str == "nvfp4_ds_mla":
+            return (num_blocks, block_size, 416)
+''',
+)
+
+replace(
+    "v1/kv_cache_interface.py",
+    '''        if self.cache_dtype_str == "nvfp4_ds_mla":
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 584
+            return self.storage_block_size * 416
+''',
+    '''        if self.cache_dtype_str == "nvfp4_ds_mla":
+            return self.storage_block_size * 416
+''',
+)
+
+replace(
+    "models/deepseek_v4/compressor.py",
+    '''        if self.head_dim == 512:
+            assert not use_fp4_cache, (
+                "MXFP4 cache is only supported for indexer (head=128)"
+            )
+            self._quant_block = 64
+            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+''',
+    '''        if self.head_dim == 512:
+            if use_fp4_cache:
+                self._quant_block = 16
+                self._token_stride = 416
+                self._scale_dim = 32
+            else:
+                self._quant_block = 64
+                self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+                self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+''',
+)
+
+replace(
+    "models/deepseek_v4/compressor.py",
+    '''            if self.head_dim == 512:
+                from .nvidia.ops import compress_norm_rope_store_cutedsl
+
+                # Main compressor path.
+                # Use a cutedsl kernel for better performance.
+                compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+''',
+    '''            if self.head_dim == 512:
+                if self.use_fp4_cache:
+                    from .nvidia.nvfp4_cache import (
+                        compress_norm_rope_store_nvfp4_416,
+                    )
+
+                    compress_norm_rope_store_fn = (
+                        compress_norm_rope_store_nvfp4_416
+                    )
+                else:
+                    from .nvidia.ops import compress_norm_rope_store_cutedsl
+
+                    compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+''',
+    )
+
+replace(
+    "models/deepseek_v4/attention.py",
+    '''        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.padded_heads,
+            self.eps,
+            swa_metadata.block_size,
+        )
+''',
+    '''        if self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla":
+            from .nvidia.nvfp4_cache import qnorm_rope_store_swa_nvfp4_416
+
+            return qnorm_rope_store_swa_nvfp4_416(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                padded_heads=self.padded_heads,
+                rms_norm_eps=self.eps,
+                cache_block_size=swa_metadata.block_size,
+            )
+
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.padded_heads,
+            self.eps,
+            swa_metadata.block_size,
+        )
+''',
+)
+
+replace(
+    "v1/attention/backends/mla/sparse_swa.py",
+    '''        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+            # head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 584)
+''',
+    '''        if cache_dtype_str == "nvfp4_ds_mla":
+            return (num_blocks, block_size, 416)
+        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+            # head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 584)
+''',
+)
+
+replace(
+    "v1/kv_cache_interface.py",
+    '''        if self.model_version == "deepseek_v4":
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+            return self.storage_block_size * 584
+''',
+    '''        if self.model_version == "deepseek_v4":
+            if self.cache_dtype_str == "nvfp4_ds_mla":
+                return self.storage_block_size * 416
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+            return self.storage_block_size * 584
+''',
+)
+
+replace(
+    "v1/core/kv_cache_utils.py",
+    '''    all_page_sizes = full_mla_spec.get_page_sizes()
+    swa_mla_groups = []
+    for sm_spec in swa_mla_specs:
+''',
+    '''    all_page_sizes = full_mla_spec.get_page_sizes()
+
+    # A 416-byte C4 page is smaller than DeepSeek V4's fixed FP32 compressor
+    # state page. Pad the largest full-MLA page to that state-page ceiling so
+    # the existing hybrid grouping can still use full-MLA sizes as candidates.
+    # The backend view remains [blocks, stored_tokens, 416]; only the raw page
+    # allocation receives the compatibility padding.
+    max_full_page_size = max(all_page_sizes)
+    max_sm_page_size = max(
+        (max(sm_spec.get_page_sizes()) for sm_spec in swa_mla_specs),
+        default=max_full_page_size,
+    )
+    if max_sm_page_size > max_full_page_size:
+        for layer_spec in full_mla_spec.kv_cache_specs.values():
+            if layer_spec.page_size_bytes == max_full_page_size:
+                object.__setattr__(
+                    layer_spec, "page_size_padded", max_sm_page_size
+                )
+        all_page_sizes = full_mla_spec.get_page_sizes()
+
+    swa_mla_groups = []
+    for sm_spec in swa_mla_specs:
+''',
+)
+
+print("Stage D true 416-byte DeepSeek V4 NVFP4 cache patches applied")
+PY
+
+RUN /opt/env/bin/python -m py_compile \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/compressor.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/flashmla.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/sm120.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/kv_cache_interface.py

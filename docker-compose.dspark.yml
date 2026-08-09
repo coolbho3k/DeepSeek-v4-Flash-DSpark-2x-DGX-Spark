@@ -130,6 +130,7 @@ services:
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --max-cudagraph-capture-size $$(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
+        ${ENFORCE_EAGER:+--enforce-eager}
         --enable-prefix-caching
         --enable-prompt-tokens-details
         --async-scheduling
@@ -137,7 +138,7 @@ services:
         --speculative-config "$${SPECULATIVE_CONFIG}"
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
-        --moe-backend flashinfer_b12x
+        --moe-backend ${MOE_BACKEND:-flashinfer_b12x}
         --tool-call-parser deepseek_v4
         --enable-auto-tool-choice
         --reasoning-parser deepseek_v4
