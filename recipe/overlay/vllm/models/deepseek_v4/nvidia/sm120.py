@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 
 
 _DECODE_MAX_TOKENS = 64
-_DECODE_SPLIT_TILE = 64
+_DECODE_SPLIT_TILE = 32
 _C128A_TOPK_ALIGNMENT = 128
 
 
@@ -341,10 +341,10 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         # layer.padded_heads by the outer wrapper.
         if layer.swa_cache_layer.kv_cache.shape[-1] == 416:
             from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
-                sparse_decode_nvfp4_416_reference,
+                sparse_attention_nvfp4_416,
             )
 
-            sparse_decode_nvfp4_416_reference(
+            sparse_attention_nvfp4_416(
                 q=q,
                 swa_cache=layer.swa_cache_layer.kv_cache,
                 swa_indices=swa_indices,
@@ -357,6 +357,8 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 sm_scale=layer.scale,
                 attn_sink=layer.attn_sink,
                 output=output,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
             )
             return
 
@@ -526,10 +528,10 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
             if swa_k_cache.shape[-1] == 416:
                 from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
-                    sparse_decode_nvfp4_416_reference,
+                    sparse_attention_nvfp4_416,
                 )
 
-                sparse_decode_nvfp4_416_reference(
+                sparse_attention_nvfp4_416(
                     q=q[query_start:query_end],
                     swa_cache=swa_k_cache,
                     swa_indices=swa_metadata.prefill_swa_indices[
@@ -550,6 +552,8 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     sm_scale=layer.scale,
                     attn_sink=layer.attn_sink,
                     output=output[query_start:query_end],
+                    mid_out=mid_out,
+                    mid_lse=mid_lse,
                 )
             else:
                 layer._sparse_mla_wrapper.run(

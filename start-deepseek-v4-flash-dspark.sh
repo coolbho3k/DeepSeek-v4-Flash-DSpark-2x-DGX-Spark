@@ -440,9 +440,16 @@ print_resolved_profile() {
   echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"
-  echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
+  echo "  DSpark speculation: ${ENABLE_DSPARK_SPECULATION:-1}"
+  if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
+    echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
+  fi
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
-  echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
+  if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
+    echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
+  else
+    echo "  cudagraph capture size: ${MAX_NUM_SEQS:-6}"
+  fi
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
   echo "  head fabric IP: $VLLM_HOST_IP"

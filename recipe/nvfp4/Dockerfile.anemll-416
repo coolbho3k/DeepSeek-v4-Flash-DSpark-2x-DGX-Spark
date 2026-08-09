@@ -1,0 +1,19 @@
+ARG BASE_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+FROM ${BASE_IMAGE}
+
+COPY recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py
+COPY recipe/nvfp4/patch-anemll-416.py /tmp/patch-anemll-416.py
+
+RUN python3 /tmp/patch-anemll-416.py \
+    && rm /tmp/patch-anemll-416.py \
+    && python3 -m py_compile \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/attention.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/compressor.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/dspark.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/sparse_mla.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py

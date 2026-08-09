@@ -15,12 +15,13 @@ DSPARK_VLLM_IMAGE="${DSPARK_VLLM_IMAGE:-vllm-dspark-runtime:dspark-nvfp4-stage-c
 DSPARK_BASE_IMAGE="${DSPARK_BASE_IMAGE:-vllm-dspark-runtime:mia-raf-pr1}"
 DSPARK_BUILD_STAGE="${DSPARK_BUILD_STAGE:-stage-c}"
 DSPARK_STAGE_C_IMAGE="${DSPARK_STAGE_C_IMAGE:-vllm-dspark-runtime:dspark-nvfp4-stage-c}"
+DSPARK_ANEMLL_BASE_IMAGE="${DSPARK_ANEMLL_BASE_IMAGE:-ghcr.io/anemll/dspark-vllm-gx10:0.1.1}"
 WORKER_BUILD="${WORKER_BUILD:-1}"
 
 case "$DSPARK_BUILD_STAGE" in
-  stage-c|stage-d-416) ;;
+  stage-c|stage-d-416|anemll-416) ;;
   *)
-    echo "DSPARK_BUILD_STAGE must be stage-c or stage-d-416 (got $DSPARK_BUILD_STAGE)" >&2
+    echo "DSPARK_BUILD_STAGE must be stage-c, stage-d-416, or anemll-416 (got $DSPARK_BUILD_STAGE)" >&2
     exit 2
     ;;
 esac
@@ -31,6 +32,16 @@ build_one() {
   local host="$1"
   local checkout="$2"
   if [ "$host" = "local" ]; then
+    if [ "$DSPARK_BUILD_STAGE" = "anemll-416" ]; then
+      docker build \
+        --build-arg BASE_IMAGE="$DSPARK_ANEMLL_BASE_IMAGE" \
+        -f "$SCRIPT_DIR/recipe/nvfp4/Dockerfile.anemll-416" \
+        -t "$DSPARK_VLLM_IMAGE" \
+        "$SCRIPT_DIR"
+      docker run --rm --entrypoint python3 "$DSPARK_VLLM_IMAGE" -c \
+        "from pathlib import Path; from vllm.models.deepseek_v4.nvidia.nvfp4_cache import RECORD_BYTES; source = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/dspark.py').read_text(); assert RECORD_BYTES == 416; assert 'attn.kv_cache_dtype == \"nvfp4_ds_mla\"' in source; assert 'qnorm_rope_store_swa_nvfp4_416' in source; print('dspark anemll nvfp4-416 image ok')"
+      return
+    fi
     local stage_c_image="$DSPARK_VLLM_IMAGE"
     if [ "$DSPARK_BUILD_STAGE" = "stage-d-416" ]; then
       stage_c_image="$DSPARK_STAGE_C_IMAGE"
@@ -69,8 +80,8 @@ build_one() {
     fi
   else
     ssh "$host" "mkdir -p '$checkout'"
-    rsync -az --delete "$SCRIPT_DIR/" "$host:$checkout/"
-    ssh "$host" "cd '$checkout' && DSPARK_BASE_IMAGE='$DSPARK_BASE_IMAGE' DSPARK_VLLM_IMAGE='$DSPARK_VLLM_IMAGE' DSPARK_BUILD_STAGE='$DSPARK_BUILD_STAGE' DSPARK_STAGE_C_IMAGE='$DSPARK_STAGE_C_IMAGE' WORKER_BUILD=0 ./build-dspark-vllm-runtime.sh"
+    rsync -az "$SCRIPT_DIR/" "$host:$checkout/"
+    ssh "$host" "cd '$checkout' && DSPARK_BASE_IMAGE='$DSPARK_BASE_IMAGE' DSPARK_VLLM_IMAGE='$DSPARK_VLLM_IMAGE' DSPARK_BUILD_STAGE='$DSPARK_BUILD_STAGE' DSPARK_STAGE_C_IMAGE='$DSPARK_STAGE_C_IMAGE' DSPARK_ANEMLL_BASE_IMAGE='$DSPARK_ANEMLL_BASE_IMAGE' WORKER_BUILD=0 ./build-dspark-vllm-runtime.sh"
   fi
 }
 

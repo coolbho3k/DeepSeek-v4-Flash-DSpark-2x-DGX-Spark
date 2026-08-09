@@ -20,7 +20,7 @@ RUN ln -sf /opt/env/bin/vllm /usr/local/bin/vllm \
     && ln -sf /opt/env/bin/aarch64-conda-linux-gnu-gcc /usr/local/bin/cc \
     && ln -sf /opt/env/bin/aarch64-conda-linux-gnu-gcc /usr/local/bin/gcc \
     && mkdir -p /usr/local/lib/python3.12/dist-packages \
-    && ln -s /opt/env/lib/python3.12/site-packages/vllm \
+    && ln -sfn /opt/env/lib/python3.12/site-packages/vllm \
         /usr/local/lib/python3.12/dist-packages/vllm
 
 RUN /opt/env/bin/python - <<'PY'
