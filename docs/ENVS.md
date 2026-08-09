@@ -136,6 +136,9 @@ Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
 - Build with `DSPARK_BUILD_STAGE=stage-d-416 ./build-dspark-vllm-runtime.sh`
 - Set `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental`
+- Merge `docker-compose.stage-c.override.yml` (the launcher does this
+  automatically for `DSPARK_BUILD_STAGE=stage-d-416`) so mixed-length DSpark
+  batches use `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - Keep `MAX_MODEL_LEN=1048576`, `ENFORCE_EAGER=1`, `MOE_BACKEND=b12x`, and
   `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`
 - The validated two-Spark profile uses `GPU_MEMORY_UTILIZATION=0.835`,

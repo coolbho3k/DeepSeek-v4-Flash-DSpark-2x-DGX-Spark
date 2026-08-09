@@ -51,7 +51,10 @@ The true 416-byte Stage-D cache is available on this feature branch. Build it
 on both nodes with `DSPARK_BUILD_STAGE=stage-d-416` and use
 `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental`. Its
 correctness-first attention bridge currently requires `ENFORCE_EAGER=1`,
-`MOE_BACKEND=b12x`, and `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`.
+`MOE_BACKEND=b12x`, `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`, and the
+Stage-C runtime override. The launcher merges that override automatically when
+`DSPARK_BUILD_STAGE=stage-d-416`; it enables ragged rejected-context handling
+for mixed-length concurrent requests.
 
 This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
 sources for local image builds and documentation. With the Anemll image, that
@@ -777,7 +780,9 @@ DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental \
 ```
 
 For Stage D, keep `ENFORCE_EAGER=1`, `MOE_BACKEND=b12x`, and
-`DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc` in `.env.dspark`.
+`DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc` in `.env.dspark`. Also keep
+`COMPOSE_OVERRIDE_FILE=docker-compose.stage-c.override.yml`; the launcher will
+otherwise infer the same override from `DSPARK_BUILD_STAGE=stage-d-416`.
 
 Prepare the model cache on both nodes (or rsync a verified hub snapshot):
 
