@@ -13,10 +13,11 @@ The packed FP4 copy includes the RoPE dimensions to retain FlashInfer's
 standard ``9 * head_dim / 16`` NVFP4 payload geometry. Attention uses FP4 for
 the first 448 NoPE dimensions and the BF16 copy for the final 64 dimensions.
 
-This module is a correctness-first bridge. Prefill gathers/dequantizes directly
-to the existing BF16 workspace. Decode gathers the selected sparse rows and
-uses PyTorch tensor-core attention; a fused sparse reader should replace that
-fallback after the record contract is validated end to end.
+SM120 attention reads these records directly into CTA-local shared memory,
+widens packed E2M1 with native vector conversions, and reuses FlashInfer's
+fused QK, BF16 RoPE, online-softmax, PV, SWA, and indexed-cache pipeline.
+Cache writers fuse normalization, RoPE, quantization, and insertion for the
+serving SWA and C4 compressed-cache paths.
 """
 
 from __future__ import annotations
@@ -1036,7 +1037,7 @@ def compress_norm_rope_store_nvfp4_416(
     token_stride: int,
     scale_dim: int,
 ) -> None:
-    """Correctness-first compressor bridge for the true 416-byte cache."""
+    """Fused compressor/writer dispatch for the true 416-byte cache."""
     del pdl_kwargs, quant_block, token_stride, scale_dim
     if not use_fp4_cache or head_dim != HEAD_DIM or rope_head_dim != ROPE_DIM:
         raise ValueError("the 416-byte writer requires the DSV4 512/64 FP4 contract")
@@ -2048,6 +2049,130 @@ def _sparse_attention_nvfp4_416_direct_mma_kernel(
     )
 
 
+def _native_page_view_416(
+    cache: torch.Tensor,
+    page_size: int,
+    *,
+    main_cache: bool,
+) -> torch.Tensor | None:
+    """Return a zero-copy page view accepted by the native SM120 kernel."""
+    if cache.ndim == 4:
+        if cache.shape[1] == 1:
+            cache = cache.squeeze(1)
+        elif cache.shape[2] == 1:
+            cache = cache.squeeze(2)
+        else:
+            return None
+    if cache.ndim != 3 or cache.shape[-1] != RECORD_BYTES:
+        return None
+    if cache.stride(-1) != 1 or cache.stride(-2) != RECORD_BYTES:
+        return None
+
+    target_page_size = 64 if main_cache or page_size >= 64 else page_size
+    if target_page_size not in (2, 64) or page_size % target_page_size != 0:
+        return None
+    if cache.shape[1] != page_size:
+        return None
+    if cache.stride(0) != page_size * RECORD_BYTES:
+        return None
+    return cache.view(-1, target_page_size, RECORD_BYTES)
+
+
+def _native_sparse_attention_nvfp4_416(
+    *,
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor,
+    swa_page_size: int,
+    indexed_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_lengths: torch.Tensor | None,
+    indexed_page_size: int | None,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+    mid_lse: torch.Tensor | None,
+) -> bool:
+    """Run FlashInfer's fused sparse pipeline for a supported static shape."""
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _MODEL_TYPE_DSV4_NVFP4,
+            get_sparse_mla_sm120_module,
+        )
+    except (ImportError, AttributeError):
+        return False
+
+    rows, heads, _ = q.shape
+    topk = swa_indices.shape[1]
+    if rows == 0:
+        return True
+    if heads not in (16, 32, 64, 128) or topk not in (128, 512, 1024, 2048):
+        return False
+    if q.stride() != (heads * HEAD_DIM, HEAD_DIM, 1):
+        return False
+    if swa_indices.stride() != (topk, 1):
+        return False
+
+    native_swa = _native_page_view_416(
+        swa_cache, int(swa_page_size), main_cache=True
+    )
+    if native_swa is None:
+        return False
+
+    native_indexed = None
+    if indexed_cache is not None:
+        if topk != 128 or indexed_page_size is None or indexed_indices is None:
+            return False
+        if indexed_lengths is None or indexed_indices.stride(-1) != 1:
+            return False
+        if indexed_indices.stride(0) != indexed_indices.shape[1]:
+            return False
+        native_indexed = _native_page_view_416(
+            indexed_cache, int(indexed_page_size), main_cache=False
+        )
+        if native_indexed is None:
+            return False
+
+    lse_elements = rows * heads
+    if mid_lse is not None and mid_lse.numel() >= lse_elements:
+        lse_storage = mid_lse.view(-1)
+    else:
+        # The SM120 backend reserves this 128 MiB buffer during its empty
+        # warmup forward. Reuse a small prefix for LSE so no allocation occurs
+        # in eager execution or CUDA graph capture.
+        from .flashinfer_sparse import _get_flashinfer_dsv4_workspace
+
+        workspace = _get_flashinfer_dsv4_workspace(q.device)
+        lse_storage = workspace.view(torch.float32)
+    if lse_storage.numel() < lse_elements:
+        raise RuntimeError(
+            f"native NVFP4 LSE workspace needs {lse_elements} float elements, "
+            f"got {lse_storage.numel()}"
+        )
+    out_lse = lse_storage[:lse_elements].view(rows, heads)
+
+    module = get_sparse_mla_sm120_module()
+    module.paged_attention(
+        q,
+        native_swa,
+        swa_indices,
+        output,
+        out_lse,
+        sm_scale,
+        HEAD_DIM,
+        _MODEL_TYPE_DSV4_NVFP4,
+        swa_lengths,
+        attn_sink,
+        native_indexed,
+        indexed_indices,
+        indexed_lengths,
+        None,
+        None,
+    )
+    return True
+
+
 def sparse_attention_nvfp4_416(
     *,
     q: torch.Tensor,
@@ -2068,9 +2193,9 @@ def sparse_attention_nvfp4_416(
 ) -> None:
     """Fused sparse attention that consumes true 416-byte records directly.
 
-    Decode uses caller-owned split-K scratch and a fused LSE merge. Large
-    prefill chunks use a one-pass online softmax, avoiding any BF16 KV or FP32
-    score materialization in both cases.
+    Auto mode prefers FlashInfer's native SM120 sparse pipeline. Unsupported
+    static shapes fall back to the direct Triton reader; neither path writes a
+    global BF16 KV or FP32 score tensor.
     """
     swa_indices = _index_matrix(swa_indices)
     if indexed_indices is not None:
@@ -2100,11 +2225,34 @@ def sparse_attention_nvfp4_416(
     # CUDA-graph capturable now that cache writing is fused, so dispatch by
     # static shape and keep the faster implementation for each regime.
     attention_mode = os.getenv("DSV4_NVFP4_ATTENTION_MODE", "auto")
-    if attention_mode not in ("auto", "direct", "reference"):
+    if attention_mode not in ("auto", "native", "direct", "reference"):
         raise ValueError(
-            "DSV4_NVFP4_ATTENTION_MODE must be auto, direct, or reference; "
+            "DSV4_NVFP4_ATTENTION_MODE must be auto, native, direct, or "
+            "reference; "
             f"got {attention_mode!r}"
         )
+    if attention_mode in ("auto", "native"):
+        used_native = _native_sparse_attention_nvfp4_416(
+            q=q,
+            swa_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+            swa_page_size=swa_page_size,
+            indexed_cache=indexed_cache,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_lengths,
+            indexed_page_size=indexed_page_size,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            output=output,
+            mid_lse=mid_lse,
+        )
+        if used_native:
+            return
+        if attention_mode == "native":
+            raise RuntimeError(
+                "native SM120 NVFP4 attention does not support this static shape"
+            )
     use_reference = attention_mode == "reference" or (
         attention_mode == "auto"
         and heads > 32
@@ -2309,12 +2457,7 @@ def sparse_decode_nvfp4_416_reference(
     attn_sink: torch.Tensor | None,
     output: torch.Tensor,
 ) -> None:
-    """Correctness bridge for sparse attention until a fused FP4 reader exists.
-
-    The SM120 FlashInfer sparse MLA kernels currently interpret these pages as
-    the 584-byte FP8 layout. Keep query chunks small here so prefill does not
-    materialize an unbounded [tokens, selected_kv, 512] tensor.
-    """
+    """Bounded dequantize-and-attend fallback and correctness oracle."""
     swa_indices = _index_matrix(swa_indices)
     if indexed_indices is not None:
         indexed_indices = _index_matrix(indexed_indices)
@@ -2383,7 +2526,7 @@ def sparse_decode_nvfp4_416_reference(
                 indexed_lengths[start:end],
                 swa_width,
                 page_size=indexed_page_size,
-                is_nvfp4=True,
+                is_nvfp4=indexed_cache.shape[-1] == RECORD_BYTES,
                 head_dim=HEAD_DIM,
                 nope_dim=NOPE_DIM,
                 fp4_data_bytes=FP4_DATA_BYTES,
