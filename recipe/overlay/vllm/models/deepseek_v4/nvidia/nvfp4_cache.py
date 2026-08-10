@@ -17,7 +17,7 @@ SM120 attention reads these records directly into CTA-local shared memory,
 widens packed E2M1 with native vector conversions, and reuses FlashInfer's
 fused QK, BF16 RoPE, online-softmax, PV, SWA, and indexed-cache pipeline.
 Cache writers fuse normalization, RoPE, quantization, and insertion for the
-serving SWA and C4 compressed-cache paths.
+serving SWA, C4, and C128 compressed-cache paths.
 """
 
 from __future__ import annotations
@@ -927,6 +927,152 @@ def _compress_norm_rope_store_c4_nvfp4_416_kernel(
     tl.store(rope_out + rope_offsets, rope_values.to(tl.bfloat16))
 
 
+@triton.jit
+def _compress_norm_rope_store_c128_nvfp4_416_kernel(
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    state_slots_ptr,
+    block_table_ptr,
+    block_table_stride0,
+    norm_weight_ptr,
+    cos_sin_ptr,
+    cos_sin_stride0,
+    cos_sin_stride1,
+    cache_ptr,
+    cache_block_stride,
+    kv_slots_ptr,
+    rms_norm_eps,
+    cache_block_size: tl.constexpr,
+    state_block_size: tl.constexpr,
+    state_width: tl.constexpr,
+    head_dim: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    fp4_data_bytes: tl.constexpr,
+    scale_group_size: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    record_bytes: tl.constexpr,
+):
+    """Fuse C128 compression through the final 416-byte cache write."""
+    row = tl.program_id(0)
+    position = tl.load(positions_ptr + row)
+    state_slot = tl.load(state_slots_ptr + row)
+    kv_slot = tl.load(kv_slots_ptr + row)
+    if (
+        state_slot < 0
+        or kv_slot < 0
+        or (position + 1) % compress_ratio != 0
+    ):
+        return
+
+    request = tl.load(token_to_req_indices_ptr + row)
+    dims = tl.arange(0, head_dim)
+    running_max = tl.full((head_dim,), -float("inf"), tl.float32)
+    running_sum = tl.zeros((head_dim,), tl.float32)
+    running_product = tl.zeros((head_dim,), tl.float32)
+
+    # C128 boundaries end at 127, 255, ...; their 128-row windows are aligned
+    # to sixteen consecutive eight-token state-cache blocks. Keep the outer
+    # block loop dynamic so the compiler does not unroll 128 full-width loads.
+    start = position - (compress_ratio - 1)
+    first_table_column = start // state_block_size
+    for block_delta in tl.range(0, compress_ratio // state_block_size):
+        physical = tl.load(
+            block_table_ptr
+            + request * block_table_stride0
+            + first_table_column
+            + block_delta
+        )
+        for block_offset in tl.static_range(0, state_block_size):
+            state_row = (
+                state_cache_ptr
+                + physical.to(tl.int64) * state_cache_stride0
+                + block_offset * state_cache_stride1
+            )
+            values = tl.load(state_row + dims).to(tl.float32)
+            scores = tl.load(state_row + state_width + dims).to(tl.float32)
+            new_max = tl.maximum(running_max, scores)
+            old_scale = tl.exp2(
+                (running_max - new_max) * 1.4426950408889634
+            )
+            new_scale = tl.exp2((scores - new_max) * 1.4426950408889634)
+            running_sum = running_sum * old_scale + new_scale
+            running_product = running_product * old_scale + values * new_scale
+            running_max = new_max
+
+    compressed = running_product / running_sum
+    inv_rms = tl.rsqrt(
+        tl.sum(compressed * compressed, axis=0) / head_dim + rms_norm_eps
+    )
+    normalized = (
+        compressed
+        * inv_rms
+        * tl.load(norm_weight_ptr + dims).to(tl.float32)
+    )
+
+    compressed_position = (position // compress_ratio) * compress_ratio
+    rope_dims = dims - nope_dim
+    pair = tl.maximum(rope_dims // 2, 0)
+    cos = tl.load(
+        cos_sin_ptr
+        + compressed_position.to(tl.int64) * cos_sin_stride0
+        + pair * cos_sin_stride1
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_ptr
+        + compressed_position.to(tl.int64) * cos_sin_stride0
+        + (rope_dim // 2 + pair) * cos_sin_stride1
+    ).to(tl.float32)
+    even_dim = nope_dim + pair * 2
+    odd_dim = even_dim + 1
+    even = tl.gather(normalized, even_dim, axis=0)
+    odd = tl.gather(normalized, odd_dim, axis=0)
+    rope = tl.where(
+        (rope_dims & 1) == 0,
+        even * cos - odd * sin,
+        odd * cos + even * sin,
+    )
+    rotated = tl.where(dims < nope_dim, normalized, rope)
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    grouped = tl.reshape(rotated, (scale_bytes, scale_group_size))
+    amax = tl.max(tl.abs(grouped), axis=1)
+    scale_fp8 = (amax * (1.0 / 6.0)).to(tl.float8e4nv)
+    rounded_scale = scale_fp8.to(tl.float32)
+    inv_scale = tl.where(
+        (amax != 0.0) & (rounded_scale != 0.0),
+        1.0 / rounded_scale,
+        0.0,
+    )
+    scaled = grouped * tl.reshape(inv_scale, (scale_bytes, 1))
+    pairs = tl.reshape(tl.reshape(scaled, (head_dim,)), (fp4_data_bytes, 2))
+    lo, hi = tl.split(pairs)
+    packed = _fp32x2_to_fp4x2(lo, hi)
+
+    block = kv_slot // cache_block_size
+    token = kv_slot % cache_block_size
+    record = (
+        cache_ptr
+        + block.to(tl.int64) * cache_block_stride
+        + token * record_bytes
+    )
+    tl.store(record + tl.arange(0, fp4_data_bytes), packed)
+    tl.store(
+        record + fp4_data_bytes + tl.arange(0, scale_bytes),
+        scale_fp8.to(tl.uint8, bitcast=True),
+    )
+    rope_out = (record + fp4_data_bytes + scale_bytes).to(
+        tl.pointer_type(tl.bfloat16)
+    )
+    rope_offsets = tl.arange(0, rope_dim)
+    rope_values = tl.gather(rotated, nope_dim + rope_offsets, axis=0)
+    tl.store(rope_out + rope_offsets, rope_values.to(tl.bfloat16))
+
+
 def compress_kv_nvfp4_416(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -1077,33 +1223,45 @@ def compress_norm_rope_store_nvfp4_416(
         )
         return
 
-    compressed = torch.empty(
-        (num_actual, HEAD_DIM), dtype=torch.float32, device=state_cache.device
-    )
-    compress_kv_nvfp4_416(
-        state_cache,
-        token_to_req_indices,
-        positions,
-        slot_mapping,
-        block_table,
-        block_size,
-        compressed,
-        state_width=state_width,
-        compress_ratio=compress_ratio,
-        overlap=overlap,
-    )
+    if compress_ratio == 128:
+        if overlap or state_width != HEAD_DIM or block_size != 8:
+            raise ValueError(
+                "the fused C128 writer requires no overlap, "
+                "state_width=512, and block_size=8"
+            )
+        _compress_norm_rope_store_c128_nvfp4_416_kernel[(num_actual,)](
+            state_cache,
+            state_cache.stride(0),
+            state_cache.stride(1),
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_table.stride(0),
+            rms_norm_weight,
+            cos_sin_cache,
+            cos_sin_cache.stride(0),
+            cos_sin_cache.stride(1),
+            kv_cache,
+            kv_cache.stride(0),
+            k_cache_metadata.slot_mapping,
+            rms_norm_eps,
+            cache_block_size=kv_cache.shape[1],
+            state_block_size=8,
+            state_width=HEAD_DIM,
+            head_dim=HEAD_DIM,
+            nope_dim=NOPE_DIM,
+            rope_dim=ROPE_DIM,
+            compress_ratio=128,
+            fp4_data_bytes=FP4_DATA_BYTES,
+            scale_group_size=SCALE_GROUP_SIZE,
+            scale_bytes=SCALE_BYTES,
+            record_bytes=RECORD_BYTES,
+            num_warps=16,
+        )
+        return
 
-    norm_rope_store_nvfp4_416(
-        compressed,
-        positions,
-        k_cache_metadata.slot_mapping,
-        rms_norm_weight,
-        cos_sin_cache,
-        kv_cache,
-        rms_norm_eps=rms_norm_eps,
-        cache_block_size=kv_cache.shape[1],
-        compress_ratio=compress_ratio,
-    )
+    raise ValueError(f"unsupported DeepSeek V4 compression ratio: {compress_ratio}")
 
 
 @triton.jit
