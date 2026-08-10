@@ -110,6 +110,12 @@ def random_nvfp4_cache(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 8, 65])
+    parser.add_argument(
+        "--extra-topk",
+        type=int,
+        default=512,
+        help="indexed/compressed entries per row (8192 models C128 at 1M)",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
@@ -157,9 +163,11 @@ def main() -> None:
     device = torch.device("cuda")
     heads = 32
     swa_topk = 128
-    extra_topk = 512
-    if args.cache_slots is not None and args.cache_slots < extra_topk:
-        parser.error("--cache-slots must be at least 512")
+    extra_topk = args.extra_topk
+    if extra_topk < 1:
+        parser.error("--extra-topk must be positive")
+    if args.cache_slots is not None and args.cache_slots < max(swa_topk, extra_topk):
+        parser.error("--cache-slots must cover both SWA and indexed widths")
     if args.index_banks < 1:
         parser.error("--index-banks must be at least 1")
     if args.index_banks > 1 and args.cache_slots is None:
@@ -216,6 +224,7 @@ def main() -> None:
     )
     sink = torch.zeros((heads,), dtype=torch.float32, device=device)
 
+    print(f"heads={heads} swa_topk={swa_topk} extra_topk={extra_topk}")
     header = "rows  fp8_584_ms  nvfp4_416_ms  ratio_416_to_584"
     if args.cuda_graph:
         header += "  fp8_graph_ms  nvfp4_graph_ms  graph_ratio  graph_static"
