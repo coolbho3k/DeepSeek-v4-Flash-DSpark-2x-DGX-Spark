@@ -114,6 +114,14 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "also benchmark allocation-static CUDA-graph replay while rotating "
+            "the sparse index contents between iterations"
+        ),
+    )
     parser.add_argument("--random-cache", action="store_true")
     parser.add_argument(
         "--cache-slots",
@@ -208,7 +216,10 @@ def main() -> None:
     )
     sink = torch.zeros((heads,), dtype=torch.float32, device=device)
 
-    print("rows  fp8_584_ms  nvfp4_416_ms  ratio_416_to_584")
+    header = "rows  fp8_584_ms  nvfp4_416_ms  ratio_416_to_584"
+    if args.cuda_graph:
+        header += "  fp8_graph_ms  nvfp4_graph_ms  graph_ratio  graph_static"
+    print(header)
     for rows in args.rows:
         q = q_all[:rows]
         swa_indices_rows = swa_indices_banks[:, :rows]
@@ -232,9 +243,13 @@ def main() -> None:
             swa_cache: torch.Tensor,
             extra_cache: torch.Tensor,
             index_bank: int = 0,
+            current_swa_indices: torch.Tensor | None = None,
+            current_extra_indices: torch.Tensor | None = None,
         ) -> None:
-            current_swa_indices = swa_indices_rows[index_bank]
-            current_extra_indices = extra_indices_rows[index_bank]
+            if current_swa_indices is None:
+                current_swa_indices = swa_indices_rows[index_bank]
+            if current_extra_indices is None:
+                current_extra_indices = extra_indices_rows[index_bank]
             chunks_per_block = (
                 args.nvfp4_chunks_per_block
                 if model_type == _MODEL_TYPE_DSV4_NVFP4
@@ -303,7 +318,87 @@ def main() -> None:
         else:
             fp8_ms = measure_fp8()
             nvfp4_ms = measure_nvfp4()
-        print(f"{rows:4d}  {fp8_ms:10.4f}  {nvfp4_ms:13.4f}  {nvfp4_ms / fp8_ms:17.3f}x")
+
+        graph_suffix = ""
+        if args.cuda_graph:
+
+            def capture_graph(
+                model_type: int,
+                swa_cache: torch.Tensor,
+                extra_cache: torch.Tensor,
+            ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]:
+                graph_swa_indices = swa_indices.clone()
+                graph_extra_indices = extra_indices.clone()
+
+                def invoke() -> None:
+                    run(
+                        model_type,
+                        swa_cache,
+                        extra_cache,
+                        current_swa_indices=graph_swa_indices,
+                        current_extra_indices=graph_extra_indices,
+                    )
+
+                invoke()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    invoke()
+                return graph, graph_swa_indices, graph_extra_indices
+
+            def measure_graph_rotating(
+                graph: torch.cuda.CUDAGraph,
+                graph_swa_indices: torch.Tensor,
+                graph_extra_indices: torch.Tensor,
+            ) -> tuple[float, bool]:
+                next_bank = 0
+
+                def prepare() -> None:
+                    nonlocal next_bank
+                    graph_swa_indices.copy_(swa_indices_rows[next_bank])
+                    graph_extra_indices.copy_(extra_indices_rows[next_bank])
+                    next_bank = (next_bank + 1) % args.index_banks
+
+                for _ in range(args.warmup):
+                    prepare()
+                    graph.replay()
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_allocated(device)
+                samples = []
+                for _ in range(args.repetitions):
+                    prepare()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    samples.append(start.elapsed_time(end))
+                static = torch.cuda.memory_allocated(device) == allocated
+                return statistics.median(samples), static
+
+            fp8_graph = capture_graph(_MODEL_TYPE_DSV4, fp8_swa, fp8_extra)
+            nvfp4_graph = capture_graph(
+                _MODEL_TYPE_DSV4_NVFP4, nv_swa, nv_extra
+            )
+            measure_fp8_graph = lambda: measure_graph_rotating(*fp8_graph)
+            measure_nvfp4_graph = lambda: measure_graph_rotating(*nvfp4_graph)
+            if args.nv_first:
+                nvfp4_graph_ms, nvfp4_static = measure_nvfp4_graph()
+                fp8_graph_ms, fp8_static = measure_fp8_graph()
+            else:
+                fp8_graph_ms, fp8_static = measure_fp8_graph()
+                nvfp4_graph_ms, nvfp4_static = measure_nvfp4_graph()
+            graph_suffix = (
+                f"  {fp8_graph_ms:12.4f}  {nvfp4_graph_ms:15.4f}  "
+                f"{nvfp4_graph_ms / fp8_graph_ms:11.3f}x  "
+                f"{str(fp8_static and nvfp4_static):12s}"
+            )
+
+        print(
+            f"{rows:4d}  {fp8_ms:10.4f}  {nvfp4_ms:13.4f}  "
+            f"{nvfp4_ms / fp8_ms:17.3f}x{graph_suffix}"
+        )
 
         if args.check:
             if args.cache_slots is not None:
