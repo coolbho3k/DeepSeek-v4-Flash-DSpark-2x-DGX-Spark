@@ -2092,6 +2092,7 @@ def _native_sparse_attention_nvfp4_416(
     sm_scale: float,
     attn_sink: torch.Tensor | None,
     output: torch.Tensor,
+    mid_out: torch.Tensor | None,
     mid_lse: torch.Tensor | None,
 ) -> bool:
     """Run FlashInfer's fused sparse pipeline for a supported static shape."""
@@ -2135,12 +2136,23 @@ def _native_sparse_attention_nvfp4_416(
             return False
 
     lse_elements = rows * heads
-    if mid_lse is not None and mid_lse.numel() >= lse_elements:
-        lse_storage = mid_lse.view(-1)
+    # Keep final LSE disjoint from the split-LSE scratch. The dedicated decode
+    # merge grid can write one head's final LSE while another block is still
+    # reading split values, so aliasing those regions is a cross-block race.
+    indexed_topk = 0 if indexed_indices is None else indexed_indices.shape[1]
+    required_splits = (topk + 63) // 64 + (indexed_topk + 63) // 64
+    split_lse_elements = lse_elements * required_splits
+    if (
+        mid_lse is not None
+        and mid_lse.numel() >= split_lse_elements + lse_elements
+    ):
+        # Unit tests and serving commonly reserve for more splits than a given
+        # call consumes. Reuse only the disjoint tail, keeping the tiny fixture
+        # tiny without adding any capture-time allocation.
+        lse_storage = mid_lse.view(-1)[split_lse_elements:]
     else:
-        # The SM120 backend reserves this 128 MiB buffer during its empty
-        # warmup forward. Reuse a small prefix for LSE so no allocation occurs
-        # in eager execution or CUDA graph capture.
+        # Reserved during the backend's empty warmup and static through CUDA
+        # graph capture.
         from .flashinfer_sparse import _get_flashinfer_dsv4_workspace
 
         workspace = _get_flashinfer_dsv4_workspace(q.device)
@@ -2167,8 +2179,8 @@ def _native_sparse_attention_nvfp4_416(
         native_indexed,
         indexed_indices,
         indexed_lengths,
-        None,
-        None,
+        mid_out,
+        mid_lse,
     )
     return True
 
@@ -2245,6 +2257,7 @@ def sparse_attention_nvfp4_416(
             sm_scale=sm_scale,
             attn_sink=attn_sink,
             output=output,
+            mid_out=mid_out,
             mid_lse=mid_lse,
         )
         if used_native:
@@ -2572,13 +2585,24 @@ def pack_reference(values: torch.Tensor, *, page_size: int) -> torch.Tensor:
     )
     grouped = values.float().reshape(rows, SCALE_BYTES, SCALE_GROUP_SIZE)
     scales = (grouped.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
-    scaled = grouped / scales.float().unsqueeze(-1)
+    inv_scales = torch.where(scales.float() != 0, scales.float().reciprocal(), 0.0)
+    scaled = grouped * inv_scales.unsqueeze(-1)
     lut = torch.tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
         device=values.device,
     )
     distances = (scaled.abs().unsqueeze(-1) - lut).abs()
-    codes = distances.argmin(dim=-1).to(torch.uint8)
+    codes = distances.argmin(dim=-1)
+    # ``cvt.rn.satfinite.e2m1x2`` resolves exact midpoints to the code with
+    # an even low bit. ``argmin`` always picks the lower code, so advance the
+    # odd lower code when its upper neighbour is equally close.
+    lower_distance = distances.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
+    upper_code = torch.clamp(codes + 1, max=7)
+    upper_distance = distances.gather(-1, upper_code.unsqueeze(-1)).squeeze(-1)
+    round_tie_up = (codes < 7) & ((codes & 1) != 0) & (
+        lower_distance == upper_distance
+    )
+    codes = (codes + round_tie_up).to(torch.uint8)
     codes |= (scaled < 0).to(torch.uint8) << 3
     codes = codes.reshape(rows, HEAD_DIM)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
