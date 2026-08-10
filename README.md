@@ -47,14 +47,15 @@ overlay build. Stage-C recipes and overlay sources remain under `recipe/`.
 When using Stage-C, also merge `docker-compose.stage-c.override.yml` and enable
 the Stage-C env block in `.env.dspark` (see [`docs/ENVS.md`](docs/ENVS.md)).
 
-The true 416-byte Stage-D cache is available on this feature branch. Build it
-on both nodes with `DSPARK_BUILD_STAGE=stage-d-416` and use
-`DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental`. Its
-correctness-first attention bridge currently requires `ENFORCE_EAGER=1`,
-`MOE_BACKEND=b12x`, `DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc`, and the
-Stage-C runtime override. The launcher merges that override automatically when
-`DSPARK_BUILD_STAGE=stage-d-416`; it enables ragged rejected-context handling
-for mixed-length concurrent requests.
+The optimized 416-byte NVFP4 cache is available on this feature branch. Build
+it on both nodes with `DSPARK_BUILD_STAGE=anemll-416` and use
+`DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`. This path
+uses the fused SM120 sparse-attention kernel, fused cache writers, static
+scratch buffers, and CUDA graphs. Keep `ENFORCE_EAGER` empty, use
+`MOE_BACKEND=flashinfer_b12x`, and set
+`DG_JIT_NVCC_COMPILER=/usr/local/cuda/bin/nvcc`. Ragged rejected-context
+handling is built into the Anemll 416 image, so it does not require the
+historical Stage-C runtime override.
 
 This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
 sources for local image builds and documentation. With the Anemll image, that
@@ -771,18 +772,20 @@ Optional: build the historical Stage-C image instead:
 # and IMAGE_PYTHON=/opt/env/bin/python for prepare-dspark-model-cache.sh
 ```
 
-Build the true 416-byte Stage-D image on both nodes:
+Build the optimized 416-byte Anemll image on both nodes:
 
 ```bash
-DSPARK_BUILD_STAGE=stage-d-416 \
-DSPARK_VLLM_IMAGE=vllm-dspark-runtime:dspark-nvfp4-416-experimental \
+DSPARK_BUILD_STAGE=anemll-416 \
+DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental \
 ./build-dspark-vllm-runtime.sh
 ```
 
-For Stage D, keep `ENFORCE_EAGER=1`, `MOE_BACKEND=b12x`, and
-`DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc` in `.env.dspark`. Also keep
-`COMPOSE_OVERRIDE_FILE=docker-compose.stage-c.override.yml`; the launcher will
-otherwise infer the same override from `DSPARK_BUILD_STAGE=stage-d-416`.
+For this path, keep `ENFORCE_EAGER` empty, `MOE_BACKEND=flashinfer_b12x`,
+`DSV4_NVFP4_ATTENTION_MODE=auto`, and
+`DG_JIT_NVCC_COMPILER=/usr/local/cuda/bin/nvcc` in `.env.dspark`. Do not set
+`COMPOSE_OVERRIDE_FILE`; the Anemll 416 image already contains the required
+DSpark runtime changes. `auto` selects the fused native kernel for supported
+serving shapes and retains a correctness fallback for unexpected shapes.
 
 Prepare the model cache on both nodes (or rsync a verified hub snapshot):
 
@@ -901,8 +904,8 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 - `--max-model-len 1048576` (**default 1M**)
 - `--max-num-seqs 6`
 - `--max-num-batched-tokens 8192`
-- `--max-cudagraph-capture-size 24` (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `6 * 4`)
-- `--gpu-memory-utilization 0.85`
+- `--max-cudagraph-capture-size 36` (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `6 * 6`)
+- `--gpu-memory-utilization 0.835`
 - `--moe-backend flashinfer_b12x`
 - `--async-scheduling`
 - `--enable-chunked-prefill`
