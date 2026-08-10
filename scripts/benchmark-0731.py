@@ -91,9 +91,16 @@ async def run_case(
     temperature,
     ignore_eos,
     per_request_max_tokens=None,
+    nonce_prefix="",
 ):
     prompts = await asyncio.gather(*[
-        asyncio.to_thread(build_prompt, base_url, model, target_prompt_tokens, f"p{target_prompt_tokens}-c{concurrency}-r{index}")
+        asyncio.to_thread(
+            build_prompt,
+            base_url,
+            model,
+            target_prompt_tokens,
+            f"{nonce_prefix}p{target_prompt_tokens}-c{concurrency}-r{index}",
+        )
         for index in range(concurrency)
     ])
     started = time.perf_counter()
@@ -134,6 +141,11 @@ async def main():
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--nonce-prefix",
+        default="",
+        help="unique prompt prefix for repeated runs with prefix caching enabled",
+    )
+    parser.add_argument(
         "--ignore-eos", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--output", required=True)
@@ -157,6 +169,7 @@ async def main():
                 args.temperature,
                 args.ignore_eos,
                 per_request_max_tokens,
+                args.nonce_prefix,
             )
             case["target_prompt_tokens"] = prompt_length
             report["cases"].append(case)

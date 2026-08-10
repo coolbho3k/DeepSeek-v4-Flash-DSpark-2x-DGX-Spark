@@ -40,7 +40,7 @@ echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} +
 echo "  breakable cudagraph: ${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 echo "  dspark slot clamp: ${DSPARK_SLOT_CLAMP:-1}"
 echo "  sampling override: none (no --override-generation-config; --generation-config vllm only)"
-echo "  WO projection: ${VLLM_USE_B12X_WO_PROJECTION:-1}"
+echo "  WO projection override: ${VLLM_USE_B12X_WO_PROJECTION:-unset}"
 echo "  host bind: ${VLLM_HOST:-127.0.0.1}"
 echo
 echo "Rendered vLLM command:"

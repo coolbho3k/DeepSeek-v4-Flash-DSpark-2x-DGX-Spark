@@ -62,9 +62,10 @@ sources for local image builds and documentation. With the Anemll image, that
 logic ships inside the image rather than as a host bind-mount.
 
 > [!NOTE]
-> **Environment variables differ by image.** The default Anemll `0.1.1` image does
-> **not** register every `VLLM_DSPARK_*` / `VLLM_USE_B12X_WO_PROJECTION` kill-switch
-> from the Stage-C overlay. Setting those on Anemll only yields
+> **Environment variables differ by image.** The optimized image retains the
+> Anemll `0.1.1` environment registry and does **not** register every
+> `VLLM_DSPARK_*` / `VLLM_USE_B12X_WO_PROJECTION` Stage-C kill-switch.
+> Setting those on the optimized image only yields
 > `Unknown vLLM environment variable` warnings (no-ops). See
 > [`docs/ENVS.md`](docs/ENVS.md). Stage-C users should merge
 > `docker-compose.stage-c.override.yml`.
@@ -72,7 +73,8 @@ logic ships inside the image rather than as a host bind-mount.
 
 **Default agent-serving profile** (`.env.dspark.example` and README defaults):
 
-- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
+- image: `vllm-dspark-runtime:anemll-nvfp4-416-experimental` (built locally
+  from `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`)
 - model: `deepseek-ai/DeepSeek-V4-Flash-0731` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
 - `max_num_seqs=6`
@@ -80,7 +82,7 @@ logic ships inside the image rather than as a host bind-mount.
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
-- `DEFAULT_THINKING=low` (`off`, `low`, `high`, or `max`; request-level overrides still win)
+- `DEFAULT_THINKING=max` (`off`, `low`, `high`, or `max`; request-level overrides still win)
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
@@ -106,11 +108,12 @@ changing the recipe default.
 > ```
 
 This repo documents the validated 0731 1M NVFP4 agent profile, historical
-preview / Stage-C checkpoints, and the current Anemll prebuilt runtime:
+preview / Stage-C checkpoints, and the optimized runtime built from Anemll:
 
 - default checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
 - default `max_model_len=1048576` (1M), `max_num_seqs=6`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
-- default image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (~2.5M-token KV pool on this cluster at util≈0.835; ~2.8M on the prior preview lane at util 0.85)
+- default image `vllm-dspark-runtime:anemll-nvfp4-416-experimental`; the
+  conservative util=0.78 validation allocated 1,699,136 compact KV token slots
 - 0731 is text-only; pair with a multimodal sidecar when image input is required
 - 900K acceptance + concurrency/prefill sweep published under `results/`
 - historical Stage-C C12 pool: `3,225,280 tokens`
@@ -676,8 +679,8 @@ usage terms.
 
 | path | purpose |
 | --- | --- |
-| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (Anemll image layout by default; installs 0731 encoder) |
-| `.env.dspark.example` | sanitized cluster template; default image Anemll `0.1.1`, **0731** / **1M** context |
+| `docker-compose.dspark.yml` | two-node vLLM/DSpark service (optimized Anemll image layout; installs 0731 encoder) |
+| `.env.dspark.example` | sanitized optimized-416 cluster template, **0731** / **1M** context |
 | [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) | 0731 checkpoint, encoder notes, sweep method, and measured results |
 | [`docs/benchmarks.png`](docs/benchmarks.png) | official 0731 decode-benchmark capture (2048 tok, concurrency sweep) |
 | [`docs/ENVS.md`](docs/ENVS.md) | Anemll vs Stage-C/Stage-D env registry matrix (unknown-`VLLM_*` warnings) |
@@ -691,11 +694,11 @@ usage terms.
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
 | `scripts/benchmark-0731.py` | streaming concurrency/prefill sweep for the 0731 endpoint |
 | `results/deepseek-v4-flash-0731-2x-dgx-spark.json` | published two-Spark 0731 sweep measurements |
-| `build-dspark-vllm-runtime.sh` | optional Stage-C or true-416-byte Stage-D image build (not required for Anemll) |
+| `build-dspark-vllm-runtime.sh` | builds and verifies the optimized Anemll 416 image on both nodes; also supports historical Stage-C/D |
 | `recipe/overlay/` | Stage-C DSpark vLLM overlay sources for local image builds |
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
 | `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C/D NVFP4 image layers for local builds |
-| `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | true 416-byte writer, gather, and correctness-first attention bridge |
+| `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | fused 416-byte writers and direct native sparse-attention dispatch |
 | `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
 | `vllm_patch_gb10/` | optional experimental GB10 hybrid NVFP4 vLLM plugin |
@@ -736,7 +739,8 @@ NCCL_IB_GID_AUTO=1
 NCCL_SOCKET_IFNAME=enp1s0f1np1
 TP_SOCKET_IFNAME=enp1s0f1np1
 GLOO_SOCKET_IFNAME=enp1s0f1np1
-DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental
+DSPARK_BUILD_STAGE=anemll-416
 ```
 
 Keep these **default** agent-serving knobs unless you are deliberately
@@ -758,7 +762,7 @@ recipe default):
 - `VLLM_USE_B12X_MOE=1`
 - `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
 
-Pull the default runtime image on **head and worker**:
+Pull the Anemll base image on **head and worker**:
 
 ```bash
 docker pull ghcr.io/anemll/dspark-vllm-gx10:0.1.1
@@ -811,9 +815,16 @@ The API bind address and port can be overridden for one launch without editing
 ./start-deepseek-v4-flash-dspark.sh --host 0.0.0.0 --port 9000
 ```
 
-These flags override `VLLM_HOST` and `VLLM_PORT` from `.env.dspark`. When the
-bind address is a wildcard, startup health checks still connect through
-`127.0.0.1` on the selected port.
+GPU allocation can also be lowered for one diagnostic launch without editing
+or backing up `.env.dspark`; the validated value is propagated to both ranks:
+
+```bash
+./start-deepseek-v4-flash-dspark.sh --gpu-memory-utilization 0.78
+```
+
+These flags override `VLLM_HOST`, `VLLM_PORT`, or `GPU_MEMORY_UTILIZATION` from
+`.env.dspark` for that launch only. When the bind address is a wildcard,
+startup health checks still connect through `127.0.0.1` on the selected port.
 
 Optional experimental GB10 hybrid NVFP4 plugin:
 
@@ -904,8 +915,10 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 - `--max-model-len 1048576` (**default 1M**)
 - `--max-num-seqs 6`
 - `--max-num-batched-tokens 8192`
-- `--max-cudagraph-capture-size 36` (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `6 * 6`)
-- `--gpu-memory-utilization 0.835`
+- requested `--max-cudagraph-capture-size 36`
+  (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `6 * 6`; Anemll vLLM 0.25
+  caps its supported maximum to 32)
+- `--gpu-memory-utilization 0.80`
 - `--moe-backend flashinfer_b12x`
 - `--async-scheduling`
 - `--enable-chunked-prefill`
@@ -914,24 +927,21 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 
 Key runtime env:
 
-- `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
+- `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`
+- `DSPARK_BUILD_STAGE=anemll-416`
+- `DSV4_NVFP4_ATTENTION_MODE=auto`
+- empty `ENFORCE_EAGER` (CUDA graphs enabled)
 - `HF_HUB_OFFLINE=1` when hub caches are complete on both nodes
 - `ENABLE_VLLM_GB10_PATCH=0` by default; set to `1` to load the optional
   `vllm_patch_gb10/` plugin and add `--quantization modelopt_gb10_hybrid`
 - `GB10_HYBRID_NVFP4_M_THRESHOLD=128`
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
 - `VLLM_USE_B12X_MOE=1`
-- `VLLM_USE_B12X_WO_PROJECTION=1`
-- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
-- `VLLM_DSPARK_CONFIDENCE_SCHEDULER=off`
-- `VLLM_DSPARK_LOCAL_ARGMAX=1`
-- `VLLM_DSPARK_REPLICATE_MARKOV_W1=1`
-- `VLLM_DSPARK_FUSED_MARKOV_ARGMAX=0`
-- `VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT=0`
-- `VLLM_DSV4_B12X_COMPRESSED_MLA=0`
-- `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE=0`
 - `B12X_W4A16_TC_DECODE=0`
 - `DG_JIT_NVCC_COMPILER=/usr/local/cuda/bin/nvcc`
+
+Stage-C-only `VLLM_DSPARK_*` and `VLLM_USE_B12X_WO_PROJECTION` knobs remain
+commented in `.env.dspark.example`; the optimized Anemll registry rejects them.
 
 ### 200k Concurrency Profile
 
@@ -1017,7 +1027,8 @@ blaming the DSpark weights.
   `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`,
   `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
-  `DSPARK_VLLM_IMAGE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1`,
+  `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`,
+  `DSPARK_BUILD_STAGE=anemll-416`,
   `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_MOE=1`, no generation override.
   Local `.env.dspark` may temporarily lower context (for example 512k) or raise
   MTP / util without changing that recipe default.

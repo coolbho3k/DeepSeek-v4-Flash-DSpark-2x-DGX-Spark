@@ -12,14 +12,17 @@ VLLM_GB10_PATCH_DIR="${VLLM_GB10_PATCH_DIR:-$SCRIPT_DIR/vllm_patch_gb10}"
 DSPARK_PROPOSER_FILE="${DSPARK_PROPOSER_FILE:-$SCRIPT_DIR/recipe/vllm/v1/spec_decode/dspark_proposer.py}"
 CLI_VLLM_HOST=""
 CLI_VLLM_PORT=""
+CLI_GPU_MEMORY_UTILIZATION=""
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--host HOST] [--port PORT]
+Usage: $(basename "$0") [--host HOST] [--port PORT] [--gpu-memory-utilization FRACTION]
 
 Options:
   --host HOST  vLLM API bind address (default: VLLM_HOST or 127.0.0.1)
   --port PORT  vLLM API listen port (default: VLLM_PORT or 8888)
+  --gpu-memory-utilization FRACTION
+               Override GPU_MEMORY_UTILIZATION for this launch only
   -h, --help   Show this help message
 
 Command-line options override values from $ENV_FILE.
@@ -46,6 +49,22 @@ while [ "$#" -gt 0 ]; do
     --port=*)
       CLI_VLLM_PORT="${1#*=}"
       [ -n "$CLI_VLLM_PORT" ] || { echo "--port requires a value." >&2; exit 2; }
+      shift
+      ;;
+    --gpu-memory-utilization)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || {
+        echo "--gpu-memory-utilization requires a value." >&2
+        exit 2
+      }
+      CLI_GPU_MEMORY_UTILIZATION="$2"
+      shift 2
+      ;;
+    --gpu-memory-utilization=*)
+      CLI_GPU_MEMORY_UTILIZATION="${1#*=}"
+      [ -n "$CLI_GPU_MEMORY_UTILIZATION" ] || {
+        echo "--gpu-memory-utilization requires a value." >&2
+        exit 2
+      }
       shift
       ;;
     -h|--help)
@@ -78,6 +97,16 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+if [ -n "$CLI_GPU_MEMORY_UTILIZATION" ]; then
+  GPU_MEMORY_UTILIZATION="$CLI_GPU_MEMORY_UTILIZATION"
+fi
+if ! awk -v value="${GPU_MEMORY_UTILIZATION:-0.80}" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value <= 1) }'; then
+  echo "GPU memory utilization must be a number in (0, 1]: ${GPU_MEMORY_UTILIZATION:-}" >&2
+  exit 2
+fi
+export GPU_MEMORY_UTILIZATION
 
 # Stage D inherits the Stage-C DSpark proposer and its registered concurrency
 # controls. Merge that runtime override automatically unless the caller names a
@@ -179,7 +208,8 @@ if [ -n "${COMPOSE_OVERRIDE_FILE:-}" ]; then
 fi
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
 REMOTE_VLLM_GB10_PATCH_DIR="$REMOTE_WORKER_DIR/vllm_patch_gb10"
-REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
+REMOTE_GPU_MEMORY_UTILIZATION="$(printf '%q' "$GPU_MEMORY_UTILIZATION")"
+REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 GPU_MEMORY_UTILIZATION=$REMOTE_GPU_MEMORY_UTILIZATION"
 STARTUP_LOG_SINCE=""
 
 need_cmd() {

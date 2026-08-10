@@ -89,7 +89,7 @@ produce unknown-env warnings if injected.
 | `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE` | Defer target cudagraph capture |
 | `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT` | Exact defer variant |
 
-Default Anemll compose **does not** inject these. For Stage-C images, merge:
+The optimized Anemll compose **does not** inject these. For Stage-C images, merge:
 
 ```bash
 docker compose --env-file .env.dspark \
@@ -115,7 +115,10 @@ docker compose --env-file .env.dspark \
 
 ## Recommended defaults by image
 
-### Anemll `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (repo default)
+### Optimized Anemll 416 image (feature-branch default)
+
+`vllm-dspark-runtime:anemll-nvfp4-416-experimental` is built from
+`ghcr.io/anemll/dspark-vllm-gx10:0.1.1` and retains its environment registry.
 
 Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
