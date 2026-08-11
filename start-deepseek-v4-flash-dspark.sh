@@ -506,7 +506,7 @@ print_resolved_profile() {
   echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"
   echo "  max model len: ${MAX_MODEL_LEN:-1048576}"
   echo "  max num seqs: ${MAX_NUM_SEQS:-4}"
-  echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
+  echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8208}"
   echo "  long prefill token threshold: $LONG_PREFILL_TOKEN_THRESHOLD (0 disables)"
   echo "  scheduling policy: $SCHEDULING_POLICY"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"

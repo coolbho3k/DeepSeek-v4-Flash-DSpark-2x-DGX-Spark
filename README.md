@@ -108,7 +108,7 @@ logic ships inside the image rather than as a host bind-mount.
 - model: `deepseek-ai/DeepSeek-V4-Flash-0731` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
 - `max_num_seqs=4`
-- `max_num_batched_tokens=8192`
+- `max_num_batched_tokens=8208` (8192 scheduled target tokens plus 16 DSpark draft slots)
 - `long_prefill_token_threshold=2048`
 - `scheduling_policy=priority`
 - `kv_cache_dtype=nvfp4_ds_mla`
@@ -133,7 +133,7 @@ headroom on both hosts. These local changes do not alter the recipe defaults.
 
 > [!IMPORTANT]
 > Use the conservative public defaults for the first successful launch,
-> especially `MAX_NUM_BATCHED_TOKENS=8192` and
+> especially `MAX_NUM_BATCHED_TOKENS=8208` and
 > `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark GPU allocations consume unified host
 > memory on both ranks. Raise utilization only in small increments after a clean
 > boot while watching available memory and swap; the local `.835` tuning value
@@ -183,7 +183,7 @@ Runtime:
 - served model name: `deepseek-v4-flash-0731`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - recipe defaults: `max_model_len=1048576`, `max_num_seqs=4`,
-  `max_num_batched_tokens=8192`, `long_prefill_token_threshold=2048`,
+  `max_num_batched_tokens=8208`, `long_prefill_token_threshold=2048`,
   `scheduling_policy=priority`, `gpu_memory_utilization=0.80`,
   `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
   `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
@@ -832,7 +832,7 @@ recipe default):
 - `VLLM_PORT=8888`
 - `MAX_MODEL_LEN=1048576` (**1M**)
 - `MAX_NUM_SEQS=4`
-- `MAX_NUM_BATCHED_TOKENS=8192`
+- `MAX_NUM_BATCHED_TOKENS=8208`
 - `LONG_PREFILL_TOKEN_THRESHOLD=2048`
 - `SCHEDULING_POLICY=priority`
 - `GPU_MEMORY_UTILIZATION=0.80`
@@ -1006,7 +1006,7 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 - `--block-size 256`
 - `--max-model-len 1048576` (**default 1M**)
 - `--max-num-seqs 4`
-- `--max-num-batched-tokens 8192`
+- `--max-num-batched-tokens 8208`
 - `--long-prefill-token-threshold 2048`
 - `--scheduling-policy priority`
 - requested `--max-cudagraph-capture-size 24`
@@ -1123,7 +1123,7 @@ blaming the DSpark weights.
   confidence scheduler.
 - The **default** agent-serving profile is `DSPARK_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731`,
   `SERVED_MODEL_NAME=deepseek-v4-flash-0731`,
-  `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8192`,
+  `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8208`,
   `LONG_PREFILL_TOKEN_THRESHOLD=2048`, `SCHEDULING_POLICY=priority`,
   `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
   `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`,

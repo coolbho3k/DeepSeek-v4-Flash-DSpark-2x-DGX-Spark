@@ -146,7 +146,7 @@ services:
         --block-size 256
         --max-model-len ${MAX_MODEL_LEN:-1048576}
         --max-num-seqs ${MAX_NUM_SEQS:-4}
-        --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
+        --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8208}
         --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-2048}
         --scheduling-policy ${SCHEDULING_POLICY:-priority}
         --max-cudagraph-capture-size "$${CUDAGRAPH_CAPTURE_SIZE}"
