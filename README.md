@@ -64,6 +64,24 @@ instead of reserving the legacy 132-byte FP8 envelope. The public profile sets
 reduces the packed allocator stride from 928,128 to 842,112 bytes per shared
 block: 9.27% fewer cache bytes, or 10.21% more blocks at matched KV memory.
 
+The Anemll 416 image also contains an opt-in, accuracy-neutral demand-sized
+allocator. Set `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1` to give each DeepSeek cache
+group its own physical backing and local block-ID namespace at that group's
+actual page stride. This removes cross-group page padding without changing the
+416-byte NVFP4 or 68-byte MXFP4 records, cache writers, attention kernels, or
+model numerics. On this cluster at `GPU_MEMORY_UTILIZATION=0.80`, repeated live
+boots reported 2.82M-2.91M usable KV tokens (the spread reflects available
+unified memory at profiling time), approximately 54% more token slots per
+available KV GiB than the shared padded allocator.
+
+Paired warmed 768-input/2048-output DSpark runs measured 83.99 and 82.63 tok/s
+with demand-sized pools versus 79.55 and 77.75 tok/s with the flag off. Treat
+that modest increase as run-to-run performance evidence, not a guaranteed
+speedup; the allocator's primary benefit is capacity. A four-session
+768-input/512-output test completed at 160.9 aggregate tok/s. The mode remains
+opt-in while KV-transfer connectors and external block-ID eviction are
+unsupported.
+
 > [!NOTE]
 > Capacity figures captured earlier in this README are retained as historical
 > raw logs. Builds before the mixed-page accounting fix over-reported equivalent
@@ -719,7 +737,11 @@ usage terms.
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
 | `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C/D NVFP4 image layers for local builds |
 | `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | fused 416-byte writers and direct native sparse-attention dispatch |
+| `recipe/nvfp4/patch-demand-sized-kv-pools.py` | opt-in per-group physical KV pools and scheduler block namespaces |
 | `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
+| `scripts/test-demand-sized-kv-pools.py` | demand-pool planner, capacity, admission, allocation, and free checks |
+| `scripts/test-demand-sized-kv-grouping.py` | page-grouping compatibility with the demand-pool flag on and off |
+| `scripts/test-demand-sized-kv-v2-allocator.py` | V2 backing-storage aliasing and pool-isolation checks |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
 | `vllm_patch_gb10/` | optional experimental GB10 hybrid NVFP4 vLLM plugin |
 | `docs/PATCHES.md` | plain-English Patch 1 / Patch 2 / Patch 2b concurrency explanation |
@@ -748,6 +770,9 @@ vLLM or FlashInfer release. Keep these constraints in mind:
   pressure.
 - DSpark acceptance and decode throughput are workload-dependent. Treat the
   included measurements as reference points, not guaranteed rates.
+- Demand-sized KV pools are currently for ordinary in-process TP serving. They
+  intentionally reject KV-transfer connectors and external block-ID eviction,
+  whose scalar block namespaces cannot safely address independent pools yet.
 
 ## Quick Start
 

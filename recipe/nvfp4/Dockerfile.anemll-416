@@ -4,16 +4,21 @@ FROM ${BASE_IMAGE}
 COPY recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
     /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py
 COPY recipe/nvfp4/patch-anemll-416.py /tmp/patch-anemll-416.py
+COPY recipe/nvfp4/patch-demand-sized-kv-pools.py \
+    /tmp/patch-demand-sized-kv-pools.py
 COPY recipe/nvfp4/patch-flashinfer-sparse-nvfp4.py \
     /tmp/patch-flashinfer-sparse-nvfp4.py
 
 RUN python3 /tmp/patch-anemll-416.py \
+    && python3 /tmp/patch-demand-sized-kv-pools.py \
     && python3 /tmp/patch-flashinfer-sparse-nvfp4.py \
     && rm /tmp/patch-anemll-416.py \
+        /tmp/patch-demand-sized-kv-pools.py \
         /tmp/patch-flashinfer-sparse-nvfp4.py \
     && python3 -m py_compile \
         /usr/local/lib/python3.12/dist-packages/flashinfer/mla/_sparse_mla_sm120.py \
         /usr/local/lib/python3.12/dist-packages/flashinfer/jit/mla.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/envs.py \
         /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/attention.py \
         /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/compressor.py \
         /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/dspark.py \
@@ -21,5 +26,10 @@ RUN python3 /tmp/patch-anemll-416.py \
         /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py \
         /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/sparse_mla.py \
         /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_manager.py \
         /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py \
-        /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/attn_utils.py \
+        /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py

@@ -181,7 +181,15 @@ case "$USE_FP4_INDEXER_CACHE" in
     exit 2
     ;;
 esac
-export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING USE_FP4_INDEXER_CACHE
+VLLM_DSV4_DEMAND_SIZED_KV_POOLS="${VLLM_DSV4_DEMAND_SIZED_KV_POOLS:-0}"
+case "$VLLM_DSV4_DEMAND_SIZED_KV_POOLS" in
+  0|1) ;;
+  *)
+    echo "VLLM_DSV4_DEMAND_SIZED_KV_POOLS must be 0 or 1 (got: $VLLM_DSV4_DEMAND_SIZED_KV_POOLS)" >&2
+    exit 2
+    ;;
+esac
+export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING USE_FP4_INDEXER_CACHE VLLM_DSV4_DEMAND_SIZED_KV_POOLS
 
 # A wildcard is valid for binding but not a useful health-check destination.
 API_HOST="${API_HOST:-$VLLM_HOST}"
@@ -507,6 +515,7 @@ print_resolved_profile() {
     echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
   fi
   echo "  MXFP4 indexer cache: $USE_FP4_INDEXER_CACHE"
+  echo "  demand-sized KV pools: $VLLM_DSV4_DEMAND_SIZED_KV_POOLS (experimental)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
     echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ))"
