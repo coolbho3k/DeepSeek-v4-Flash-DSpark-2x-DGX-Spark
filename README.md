@@ -16,7 +16,7 @@ model length using the experimental `nvfp4_ds_mla` KV-cache path.
 
 ## Current runtime (this checkout)
 
-The default Docker image is the prebuilt Anemll GX10/DGX Spark port of vLLM
+The default Docker base image is the prebuilt Anemll GX10/DGX Spark port of vLLM
 0.25 with native DSpark / NVFP4 DS-MLA / b12x MoE support:
 
 ```text
@@ -77,8 +77,10 @@ logic ships inside the image rather than as a host bind-mount.
   from `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`)
 - model: `deepseek-ai/DeepSeek-V4-Flash-0731` (HF hub id; resolved offline from cache when `HF_HUB_OFFLINE=1`)
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
-- `max_num_seqs=6`
+- `max_num_seqs=4`
 - `max_num_batched_tokens=8192`
+- `long_prefill_token_threshold=2048`
+- `scheduling_policy=priority`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
@@ -86,32 +88,30 @@ logic ships inside the image rather than as a host bind-mount.
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (keep regular CUDA graphs; Anemll auto-enables the slower breakable path when unset)
 - API bind address `0.0.0.0:8888`
 
-Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) or raise
-`MTP_NUM_TOKENS` / `GPU_MEMORY_UTILIZATION` for a specific cluster without
-changing the recipe default.
+Local `.env.dspark` may lower `MAX_MODEL_LEN` (for example `512000`) or
+`MAX_NUM_SEQS`, or cautiously raise `GPU_MEMORY_UTILIZATION` after validating
+headroom on both hosts. These local changes do not alter the recipe defaults.
 
 > [!IMPORTANT]
 > This profile is meant for real deep-context agent serving: up to **1M tokens
-> per separate session** with `MAX_NUM_SEQS=6`. The KV cache is a shared pool,
-> so six sessions do not each reserve 1M tokens up front. Normal agent
+> per separate session** with `MAX_NUM_SEQS=4`. The KV cache is a shared pool,
+> so four sessions do not each reserve 1M tokens up front. Normal agent
 > sessions can run concurrently while retaining the 1M ceiling for unusually
 > long requests.
 
 > [!IMPORTANT]
-> For long coding tasks and big prompts, use:
->
-> ```env
-> MAX_MODEL_LEN=1048576
-> MAX_NUM_SEQS=4
-> MAX_NUM_BATCHED_TOKENS=16384
-> GPU_MEMORY_UTILIZATION=0.87
-> ```
+> Use the conservative public defaults for the first successful launch,
+> especially `MAX_NUM_BATCHED_TOKENS=8192` and
+> `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark GPU allocations consume unified host
+> memory on both ranks. Raise utilization only in small increments after a clean
+> boot while watching available memory and swap; the local `.835` tuning value
+> is not a portable first-run default.
 
 This repo documents the validated 0731 1M NVFP4 agent profile, historical
 preview / Stage-C checkpoints, and the optimized runtime built from Anemll:
 
-- default checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
-- default `max_model_len=1048576` (1M), `max_num_seqs=6`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
+- PR #14 benchmark checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
+- default `max_model_len=1048576` (1M), `max_num_seqs=4`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
 - default image `vllm-dspark-runtime:anemll-nvfp4-416-experimental`; the
   conservative util=0.78 validation allocated 1,699,136 compact KV token slots
 - 0731 is text-only; pair with a multimodal sidecar when image input is required
@@ -138,17 +138,20 @@ Current default from [#14](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark
 The 0731 checkpoint keeps the same DSpark block-size-5 structure and 1M
 context ceiling as the preview checkpoint; message encoding is not identical.
 See [`docs/DEEPSEEK_V4_FLASH_0731.md`](docs/DEEPSEEK_V4_FLASH_0731.md) for the
-pinned revision, encoder install / reasoning-effort compatibility layer,
+benchmark revision, encoder install / reasoning-effort compatibility layer,
 validation requirements, and full sweep.
 
 Runtime:
 
-- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
-- model id: `deepseek-ai/DeepSeek-V4-Flash-0731` (revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`)
+- image: locally built `vllm-dspark-runtime:anemll-nvfp4-416-experimental`
+  (base `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`)
+- model id: `deepseek-ai/DeepSeek-V4-Flash-0731` (PR #14 benchmark revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`)
 - served model name: `deepseek-v4-flash-0731`
 - `kv_cache_dtype=nvfp4_ds_mla`
-- recipe defaults: `max_model_len=1048576`, `max_num_seqs=6`,
-  `max_num_batched_tokens=8192`, `gpu_memory_utilization=0.80`, `MTP_NUM_TOKENS=5`
+- recipe defaults: `max_model_len=1048576`, `max_num_seqs=4`,
+  `max_num_batched_tokens=8192`, `long_prefill_token_threshold=2048`,
+  `scheduling_policy=priority`, `gpu_memory_utilization=0.80`,
+  `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - compose installs checkpoint `encoding/encoding_dsv4.py` into vLLM on both ranks
   (override with `DSPARK_ENCODING_FILE` when needed)
@@ -158,13 +161,15 @@ Runtime:
 - fabric: explicit `VLLM_HOST_IP` / `WORKER_VLLM_HOST_IP`, plus matching
   `NCCL_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`
 
-Live boot evidence on this cluster (0731, Anemll `0.1.1`, local knobs
-`MAX_NUM_SEQS=4`, `MTP_NUM_TOKENS=6`, `GPU_MEMORY_UTILIZATION=0.835`):
+Live boot evidence on this cluster with the optimized 416-byte image
+(0731 snapshot `7872f01b1d1fe23eabc4c98b48bffcef5a386062`, Anemll
+`0.1.1` base, local knobs `MAX_NUM_SEQS=4`, `MTP_NUM_TOKENS=5`,
+`GPU_MEMORY_UTILIZATION=0.835`):
 
 ```text
-Available KV cache memory: 18.08 GiB
-GPU KV cache size: 2,493,464 tokens
-Maximum concurrency for 1,048,576 tokens per request: 2.38x
+Available KV cache memory: 17.66 GiB
+GPU KV cache size: 2,779,464 tokens
+Maximum concurrency for 1,048,576 tokens per request: 2.65x
 Application startup complete.
 ```
 
@@ -523,9 +528,9 @@ Three independent knobs, often confused:
 
 | knob | what it is | this build |
 | --- | --- | --- |
-| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | ~2.49M tokens on 0731 / Anemll (this cluster @ util 0.835); ~2.8M on preview Anemll @ util 0.85; ~3.2M on historical Stage-C C12 |
+| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | 2,779,464 tokens on the current optimized 416-byte image at util 0.835; capacity varies with util, graph coverage, and image |
 | `max_model_len` | per-request **ceiling** — how long any one request may grow | **1,048,576 (1M)** default |
-| `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | 6 (recipe default; this cluster currently runs 4) |
+| `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | **4** default |
 
 The pool is **shared and allocated on demand**: PagedAttention hands KV blocks
 to each request as it generates tokens and frees them when it finishes.
@@ -536,22 +541,22 @@ NOT pre-allocate `max_num_seqs × max_model_len` of KV. So the real constraint i
 sum(live tokens across all active requests) <= KV pool
 ```
 
-Worked examples at 1M ceiling / 6 slots:
+Worked examples at the 1M ceiling / 4 slots:
 
 ```
-6 requests x  50k tokens =  300k   fits easily
-6 requests x 200k tokens =  1.2M   fits in the Anemll / C12 pools
-6 requests x 500k tokens =  3.0M   near pool capacity depending on image
-3 requests x 1M   tokens =  3.0M   near pool capacity depending on image
-6 requests x 1M   tokens =  6.0M   impossible — excess requests queue/preempt
+4 requests x  50k tokens =  200k   fits easily
+4 requests x 200k tokens =  800k   fits easily
+4 requests x 500k tokens =  2.0M   fits the current pool, with limited headroom
+2 requests x 1M   tokens =  2.0M   fits the current pool
+4 requests x 1M   tokens =  4.0M   impossible — excess requests queue/preempt
 ```
 
-The boot log's `Maximum concurrency for 1,048,576 tokens per request: ~2.4x`
+The boot log's `Maximum concurrency for 1,048,576 tokens per request: 2.65x`
 (0731 on this cluster) only means a few *simultaneous full-1M*
-requests fit. Agent turns are almost never near 1M, so six normal-length
+requests fit. Agent turns are almost never near 1M, so four normal-length
 sessions share the pool while the 1M ceiling stays available for the rare long
-one. That is exactly why `1M + max_num_seqs=6` is useful: you are not
-reserving 6×1M, you are sharing one pool across short requests under a high
+one. That is exactly why `1M + max_num_seqs=4` is useful: you are not
+reserving 4×1M, you are sharing one pool across short requests under a high
 ceiling.
 
 ## Gotcha: gibberish, loops, Chinese drift, or prompt/XML leakage
@@ -585,7 +590,7 @@ On this deployment there are three checks to make before blaming the weights:
    win.
 
 The compose launcher includes `--generation-config vllm` and defaults to
-`DEFAULT_THINKING=low`. It validates `off`, `low`, `high`, or `max` and
+`DEFAULT_THINKING=max`. It validates `off`, `low`, `high`, or `max` and
 translates the selected mode into vLLM chat-template kwargs; explicit
 request-level overrides still win. It uses DSpark speculative decoding with
 `MTP_NUM_TOKENS=5` and
@@ -705,13 +710,44 @@ usage terms.
 | `docs/PATCHES.md` | plain-English Patch 1 / Patch 2 / Patch 2b concurrency explanation |
 | `scripts/verify-overlay-sources.sh` | checks overlay sources before Stage-C image build |
 
+## Experimental status and known limitations
+
+This feature branch is ready for hands-on testing, but it is not an upstream
+vLLM or FlashInfer release. Keep these constraints in mind:
+
+- It has been validated on one two-node DGX Spark cluster with ConnectX-7/RoCE
+  and the exact Anemll `0.1.1` base image.
+- Model preparation follows the Hugging Face repository main ref. PR #14
+  benchmarked revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`; the current
+  optimized boot used snapshot `7872f01b1d1fe23eabc4c98b48bffcef5a386062`.
+- The optimized image is built locally on both nodes. The build uses guarded
+  source anchors and intentionally fails if an incompatible base image changes.
+- Previously unseen attention, MoE, or prefill shapes can trigger multi-minute
+  JIT compilation. The persistent Triton and TileLang cache paths prevent the
+  same compilation from recurring after the first successful run.
+- The 2048-token long-prefill cap mitigates interactive starvation, but it is a
+  static vLLM scheduler limit rather than full compute-fair scheduling. A huge
+  prefill can still reduce decode throughput for another live request.
+- Start at `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark uses unified memory, so a
+  value that is stable on one pair can put another pair under host-memory
+  pressure.
+- DSpark acceptance and decode throughput are workload-dependent. Treat the
+  included measurements as reference points, not guaranteed rates.
+
 ## Quick Start
 
-Run from the head node.
+Run these commands on the head node. The build and launch scripts sync the
+required checkout files to the worker, so a separate manual worker clone is not
+required.
 
 ```bash
+git clone --branch feature/nvfp4-416-kv-cache --single-branch \
+  https://github.com/coolbho3k/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark.git
+cd DeepSeek-v4-Flash-DSpark-2x-DGX-Spark
 cp .env.dspark.example .env.dspark
 ```
+
+If this branch is already checked out, start with the `cp` command.
 
 Edit these values for your cluster:
 
@@ -752,15 +788,26 @@ recipe default):
 - `VLLM_HOST=0.0.0.0` if Hermes/OpenClaw or another machine must reach the API
 - `VLLM_PORT=8888`
 - `MAX_MODEL_LEN=1048576` (**1M**)
-- `MAX_NUM_SEQS=6`
+- `MAX_NUM_SEQS=4`
 - `MAX_NUM_BATCHED_TOKENS=8192`
+- `LONG_PREFILL_TOKEN_THRESHOLD=2048`
+- `SCHEDULING_POLICY=priority`
 - `GPU_MEMORY_UTILIZATION=0.80`
 - `MTP_NUM_TOKENS=5`
+- `DEFAULT_THINKING=max`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - `HF_HUB_OFFLINE=1` after both nodes have a full model cache
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
 - `VLLM_USE_B12X_MOE=1`
 - `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
+- `TRITON_CACHE_DIR=/cache/huggingface/vllm-cache/triton`
+- `TILELANG_CACHE_DIR=/cache/huggingface/vllm-cache/tilelang`
+
+Check the edited configuration before building:
+
+```bash
+./validate-dspark-config.sh
+```
 
 Pull the Anemll base image on **head and worker**:
 
@@ -860,9 +907,9 @@ access at the network/firewall layer.
 The 0731 checkpoint has no Hugging Face Jinja `chat_template`.
 `--tokenizer-mode deepseek_v4` instead calls the checkpoint's installed
 `encoding/encoding_dsv4.py`, which supports `off`, `low`, `high`, and `max`.
-The recipe defaults to `DEFAULT_THINKING=low`, the base reasoning mode. This
-mode opens `<think>` but adds no effort prefix. Clients should still send an
-explicit request-level override when they require deterministic behavior.
+The recipe defaults to `DEFAULT_THINKING=max`, which requests the full
+reasoning mode when a client sends no override. Clients can still select
+`off`, `low`, or `high` per request; request-level controls always win.
 
 A ready-to-copy pi configuration is provided in
 [`pi-models.dspark.example.json`](pi-models.dspark.example.json):
@@ -901,11 +948,12 @@ the custom encoder runs, so tool-call reasoning is not lost.
 
 ## Runtime Profile
 
-### C12 Agent-Serving Profile (default: 1M context)
+### Agent-Serving Profile (default: 1M context)
 
 Core vLLM flags (from `docker-compose.dspark.yml`):
 
-- image: `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (override with `DSPARK_VLLM_IMAGE`)
+- image: `vllm-dspark-runtime:anemll-nvfp4-416-experimental` built from
+  `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` (override with `DSPARK_VLLM_IMAGE`)
 - `/usr/local/bin/vllm serve …`
 - `--tensor-parallel-size 2`
 - `--distributed-executor-backend mp`
@@ -913,16 +961,18 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 - `--kv-cache-dtype nvfp4_ds_mla`
 - `--block-size 256`
 - `--max-model-len 1048576` (**default 1M**)
-- `--max-num-seqs 6`
+- `--max-num-seqs 4`
 - `--max-num-batched-tokens 8192`
-- requested `--max-cudagraph-capture-size 36`
-  (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `6 * 6`; Anemll vLLM 0.25
-  caps its supported maximum to 32)
+- `--long-prefill-token-threshold 2048`
+- `--scheduling-policy priority`
+- requested `--max-cudagraph-capture-size 24`
+  (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `4 * 6`; exactly supported by Anemll vLLM 0.25
+  uses this capture size without truncation)
 - `--gpu-memory-utilization 0.80`
 - `--moe-backend flashinfer_b12x`
 - `--async-scheduling`
 - `--enable-chunked-prefill`
-- `--speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS:-3},"draft_sample_method":"probabilistic"}'`
+- `--speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS:-5},"draft_sample_method":"probabilistic"}'`
 - `--generation-config vllm`
 
 Key runtime env:
@@ -930,8 +980,13 @@ Key runtime env:
 - `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`
 - `DSPARK_BUILD_STAGE=anemll-416`
 - `DSV4_NVFP4_ATTENTION_MODE=auto`
+- `DEFAULT_THINKING=max`
+- `LONG_PREFILL_TOKEN_THRESHOLD=2048`
+- `SCHEDULING_POLICY=priority`
 - empty `ENFORCE_EAGER` (CUDA graphs enabled)
 - `HF_HUB_OFFLINE=1` when hub caches are complete on both nodes
+- persistent `TRITON_CACHE_DIR` and `TILELANG_CACHE_DIR` under the node-local
+  Hugging Face cache mount
 - `ENABLE_VLLM_GB10_PATCH=0` by default; set to `1` to load the optional
   `vllm_patch_gb10/` plugin and add `--quantization modelopt_gb10_hybrid`
 - `GB10_HYBRID_NVFP4_M_THRESHOLD=128`
@@ -1024,14 +1079,15 @@ blaming the DSpark weights.
   confidence scheduler.
 - The **default** agent-serving profile is `DSPARK_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731`,
   `SERVED_MODEL_NAME=deepseek-v4-flash-0731`,
-  `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=6`, `MAX_NUM_BATCHED_TOKENS=8192`,
-  `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`,
+  `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8192`,
+  `LONG_PREFILL_TOKEN_THRESHOLD=2048`, `SCHEDULING_POLICY=priority`,
+  `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
   `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`,
   `DSPARK_BUILD_STAGE=anemll-416`,
   `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_MOE=1`, no generation override.
-  Local `.env.dspark` may temporarily lower context (for example 512k) or raise
-  MTP / util without changing that recipe default.
+  Local `.env.dspark` may temporarily lower context or concurrency, or cautiously
+  tune utilization after verifying memory headroom, without changing those defaults.
 - Worker-first startup avoids a race during multi-node `mp` initialization and
   validates rendered compose on both nodes before starting containers.
 - Requires matching images on both nodes, correct NCCL/RoCE settings, and a

@@ -62,6 +62,8 @@ PY
 | `VLLM_B12X_W4A16_FORCE_TILE_CONFIG` | Experimental W4A16 selector |
 | `VLLM_HOST_IP` | Distributed bind address |
 | `VLLM_CACHE_ROOT` | vLLM cache root (compose sets path) |
+| `TRITON_CACHE_DIR` | Persistent Triton JIT cache under the node-local `HF_CACHE` mount |
+| `TILELANG_CACHE_DIR` | Persistent TileLang kernel cache under the node-local `HF_CACHE` mount |
 | `CUTE_DSL_ARCH` | **Not** `VLLM_*` — CuTeDSL/b12x compile target (`sm_121a` on GB10) |
 | `TORCH_CUDA_ARCH_LIST` / `FLASHINFER_CUDA_ARCH_LIST` | Build/JIT arch lists |
 | `NCCL_*` / `TP_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` | Fabric |
@@ -122,7 +124,8 @@ docker compose --env-file .env.dspark \
 
 Keep the slim set in `.env.dspark.example` + `docker-compose.dspark.yml`:
 
-- Serve profile: `MTP_NUM_TOKENS=5`, capture `max_num_seqs * (k+1)`, `GPU_MEMORY_UTILIZATION≈0.80`
+- Serve profile: `MAX_NUM_SEQS=4`, `MTP_NUM_TOKENS=5`, capture `max_num_seqs * (k+1)`, `GPU_MEMORY_UTILIZATION≈0.80`
+- `LONG_PREFILL_TOKEN_THRESHOLD=2048`, `SCHEDULING_POLICY=priority`, `DEFAULT_THINKING=max`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0` (explicit opt-out; omission auto-enables the slower breakable path on DS4)
 - `VLLM_USE_B12X_MOE=1`
 - `CUTE_DSL_ARCH=sm_121a` (GB10 CuTeDSL target; prevents slower JIT fallbacks)

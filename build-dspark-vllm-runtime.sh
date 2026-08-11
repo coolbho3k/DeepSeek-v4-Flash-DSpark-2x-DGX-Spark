@@ -11,9 +11,9 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
-DSPARK_VLLM_IMAGE="${DSPARK_VLLM_IMAGE:-vllm-dspark-runtime:dspark-nvfp4-stage-c}"
+DSPARK_VLLM_IMAGE="${DSPARK_VLLM_IMAGE:-vllm-dspark-runtime:anemll-nvfp4-416-experimental}"
 DSPARK_BASE_IMAGE="${DSPARK_BASE_IMAGE:-vllm-dspark-runtime:mia-raf-pr1}"
-DSPARK_BUILD_STAGE="${DSPARK_BUILD_STAGE:-stage-c}"
+DSPARK_BUILD_STAGE="${DSPARK_BUILD_STAGE:-anemll-416}"
 DSPARK_STAGE_C_IMAGE="${DSPARK_STAGE_C_IMAGE:-vllm-dspark-runtime:dspark-nvfp4-stage-c}"
 DSPARK_ANEMLL_BASE_IMAGE="${DSPARK_ANEMLL_BASE_IMAGE:-ghcr.io/anemll/dspark-vllm-gx10:0.1.1}"
 WORKER_BUILD="${WORKER_BUILD:-1}"

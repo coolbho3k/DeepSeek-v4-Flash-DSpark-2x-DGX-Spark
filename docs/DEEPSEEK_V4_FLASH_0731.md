@@ -5,7 +5,7 @@
 ## Checkpoint
 
 - Repository: `deepseek-ai/DeepSeek-V4-Flash-0731`
-- Tested revision: `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
+- Benchmark-tested revision: `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
 - Context: `1048576`
 - DSpark block size: `5`
 - Quantization metadata: FP8 weights
@@ -26,10 +26,10 @@ behavior—DSML tools, `<think>` boundaries, `high`/`max` instruction prefixes,
 and retention of tool-turn `reasoning_content`—but it is not loaded by this
 vLLM profile. Here, request controls are consumed by vLLM's custom tokenizer
 wrapper and passed to the Python encoder. The underlying implementations fall
-back to non-thinking when no kwarg exists, but this recipe defaults
-`DEFAULT_THINKING=low` to match DeepSeek V4's intended base reasoning mode.
-The setting accepts `off`, `low`, `high`, or `max`; `low` opens
-`<think>` but adds no effort instruction. For pi, use
+back to non-thinking when no kwarg exists, but this recipe defaults to
+`DEFAULT_THINKING=max` so clients that omit an override receive full reasoning
+effort. The setting also accepts `off`, `low`, or `high`; request-level values
+always take precedence. For pi, use
 `pi-models.dspark.example.json`; it maps pi's off/low/high/max selector
 to request-level `chat_template_kwargs.thinking` and
 `chat_template_kwargs.reasoning_effort`.

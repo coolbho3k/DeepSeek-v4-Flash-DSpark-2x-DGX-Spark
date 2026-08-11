@@ -106,7 +106,27 @@ if ! awk -v value="${GPU_MEMORY_UTILIZATION:-0.80}" \
   echo "GPU memory utilization must be a number in (0, 1]: ${GPU_MEMORY_UTILIZATION:-}" >&2
   exit 2
 fi
-export GPU_MEMORY_UTILIZATION
+
+LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-2048}"
+if ! [[ "$LONG_PREFILL_TOKEN_THRESHOLD" =~ ^[0-9]+$ ]]; then
+  echo "LONG_PREFILL_TOKEN_THRESHOLD must be a non-negative integer: $LONG_PREFILL_TOKEN_THRESHOLD" >&2
+  exit 2
+fi
+if (( 10#$LONG_PREFILL_TOKEN_THRESHOLD > ${MAX_MODEL_LEN:-1048576} )); then
+  echo "LONG_PREFILL_TOKEN_THRESHOLD cannot exceed MAX_MODEL_LEN: $LONG_PREFILL_TOKEN_THRESHOLD > ${MAX_MODEL_LEN:-1048576}" >&2
+  exit 2
+fi
+
+SCHEDULING_POLICY="${SCHEDULING_POLICY:-priority}"
+case "$SCHEDULING_POLICY" in
+  fcfs|priority) ;;
+  *)
+    echo "SCHEDULING_POLICY must be fcfs or priority: $SCHEDULING_POLICY" >&2
+    exit 2
+    ;;
+esac
+
+export GPU_MEMORY_UTILIZATION LONG_PREFILL_TOKEN_THRESHOLD SCHEDULING_POLICY
 
 # Stage D inherits the Stage-C DSpark proposer and its registered concurrency
 # controls. Merge that runtime override automatically unless the caller names a
@@ -145,7 +165,7 @@ fi
 VLLM_PORT="$((10#$VLLM_PORT))"
 # Keep PORT as a backwards-compatible alias, but use VLLM_PORT internally.
 PORT="$VLLM_PORT"
-DEFAULT_THINKING="${DEFAULT_THINKING:-low}"
+DEFAULT_THINKING="${DEFAULT_THINKING:-max}"
 case "$DEFAULT_THINKING" in
   off|low|high|max) ;;
   *)
@@ -209,7 +229,9 @@ fi
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
 REMOTE_VLLM_GB10_PATCH_DIR="$REMOTE_WORKER_DIR/vllm_patch_gb10"
 REMOTE_GPU_MEMORY_UTILIZATION="$(printf '%q' "$GPU_MEMORY_UTILIZATION")"
-REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 GPU_MEMORY_UTILIZATION=$REMOTE_GPU_MEMORY_UTILIZATION"
+REMOTE_LONG_PREFILL_TOKEN_THRESHOLD="$(printf '%q' "$LONG_PREFILL_TOKEN_THRESHOLD")"
+REMOTE_SCHEDULING_POLICY="$(printf '%q' "$SCHEDULING_POLICY")"
+REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 GPU_MEMORY_UTILIZATION=$REMOTE_GPU_MEMORY_UTILIZATION LONG_PREFILL_TOKEN_THRESHOLD=$REMOTE_LONG_PREFILL_TOKEN_THRESHOLD SCHEDULING_POLICY=$REMOTE_SCHEDULING_POLICY"
 STARTUP_LOG_SINCE=""
 
 need_cmd() {
@@ -437,7 +459,7 @@ on_error() {
 
 run_mixed_context_smoke() {
   local model long_prompt long_pid short_pid long_status=0 short_status=0
-  model="${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
+  model="${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"
   printf -v long_prompt 'NVFP4 mixed-context validation datum. %.0s' {1..900}
 
   echo "Running unequal-context DSpark concurrency request..."
@@ -464,11 +486,13 @@ print_resolved_profile() {
   echo "  project: $PROJECT_NAME"
   echo "  image: $DSPARK_VLLM_IMAGE"
   echo "  compose override: ${COMPOSE_OVERRIDE_FILE:-none}"
-  echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
-  echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
-  echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
-  echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
+  echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+  echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"
+  echo "  max model len: ${MAX_MODEL_LEN:-1048576}"
+  echo "  max num seqs: ${MAX_NUM_SEQS:-4}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
+  echo "  long prefill token threshold: $LONG_PREFILL_TOKEN_THRESHOLD (0 disables)"
+  echo "  scheduling policy: $SCHEDULING_POLICY"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"
   echo "  DSpark speculation: ${ENABLE_DSPARK_SPECULATION:-1}"
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
@@ -476,9 +500,9 @@ print_resolved_profile() {
   fi
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
-    echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
+    echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ))"
   else
-    echo "  cudagraph capture size: ${MAX_NUM_SEQS:-6}"
+    echo "  cudagraph capture size: ${MAX_NUM_SEQS:-4}"
   fi
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
@@ -528,7 +552,7 @@ fi
 docker compose version >/dev/null
 docker image inspect "$DSPARK_VLLM_IMAGE" >/dev/null || {
   echo "Missing local Docker image $DSPARK_VLLM_IMAGE." >&2
-  echo "Pull it (e.g. docker pull $DSPARK_VLLM_IMAGE) or run ./build-dspark-vllm-runtime.sh for a local Stage-C build." >&2
+  echo "Run ./build-dspark-vllm-runtime.sh first, or pull the image if DSPARK_VLLM_IMAGE names a published tag." >&2
   exit 1
 }
 
@@ -539,7 +563,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_HOST" "true" >/dev/null || {
 
 ssh "$WORKER_HOST" "docker image inspect '$DSPARK_VLLM_IMAGE' >/dev/null" || {
   echo "Missing worker Docker image $DSPARK_VLLM_IMAGE." >&2
-  echo "Pull it on the worker (e.g. docker pull $DSPARK_VLLM_IMAGE) or run ./build-dspark-vllm-runtime.sh." >&2
+  echo "Run ./build-dspark-vllm-runtime.sh from the head to build both nodes, or pull a published override on the worker." >&2
   exit 1
 }
 
@@ -596,7 +620,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "Running minimal OpenAI-compatible chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0,"max_tokens":8,"chat_template_kwargs":{"thinking":false}}' >/dev/null
+      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0,"max_tokens":8,"chat_template_kwargs":{"thinking":false}}' >/dev/null
     echo "Minimal chat request succeeded."
     run_mixed_context_smoke
     exit 0

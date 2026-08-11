@@ -1,6 +1,6 @@
 services:
   vllm-dspark:
-    image: ${DSPARK_VLLM_IMAGE:-ghcr.io/anemll/dspark-vllm-gx10:0.1.1}
+    image: ${DSPARK_VLLM_IMAGE:-vllm-dspark-runtime:anemll-nvfp4-416-experimental}
     pull_policy: if_not_present
     entrypoint: []
     network_mode: host
@@ -35,6 +35,10 @@ services:
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
       DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
       VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
+      # Keep runtime-compiled kernels across container recreation on both
+      # ranks. /cache/huggingface is a worker-local persistent host mount.
+      TRITON_CACHE_DIR: "${TRITON_CACHE_DIR:-/cache/huggingface/vllm-cache/triton}"
+      TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/vllm-cache/tilelang}"
       VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
 
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
@@ -88,8 +92,10 @@ services:
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
       ENABLE_DSPARK_SPECULATION: "${ENABLE_DSPARK_SPECULATION:-1}"
       DSV4_NVFP4_ATTENTION_MODE: "${DSV4_NVFP4_ATTENTION_MODE:-auto}"
-      DEFAULT_THINKING: "${DEFAULT_THINKING:-low}"
+      DEFAULT_THINKING: "${DEFAULT_THINKING:-max}"
       ASYNC_SCHEDULING: "${ASYNC_SCHEDULING:-1}"
+      LONG_PREFILL_TOKEN_THRESHOLD: "${LONG_PREFILL_TOKEN_THRESHOLD:-2048}"
+      SCHEDULING_POLICY: "${SCHEDULING_POLICY:-priority}"
 
     command:
       - bash
@@ -113,9 +119,9 @@ services:
         SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
         SPECULATIVE_ARGS=();
         if [ "$${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then SPECULATIVE_ARGS=(--speculative-config "$${SPECULATIVE_CONFIG}"); fi;
-        CUDAGRAPH_CAPTURE_SIZE=$$(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ));
-        if [ "$${ENABLE_DSPARK_SPECULATION:-1}" = "0" ]; then CUDAGRAPH_CAPTURE_SIZE=${MAX_NUM_SEQS:-6}; fi;
-        case "$${DEFAULT_THINKING:-low}" in
+        CUDAGRAPH_CAPTURE_SIZE=$$(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ));
+        if [ "$${ENABLE_DSPARK_SPECULATION:-1}" = "0" ]; then CUDAGRAPH_CAPTURE_SIZE=${MAX_NUM_SEQS:-4}; fi;
+        case "$${DEFAULT_THINKING:-max}" in
           off) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":false}' ;;
           low) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"low"}' ;;
           high) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"high"}' ;;
@@ -124,8 +130,8 @@ services:
         esac;
         ASYNC_SCHEDULING_ARGS="--async-scheduling";
         if [ "$${ASYNC_SCHEDULING:-1}" = "0" ]; then ASYNC_SCHEDULING_ARGS="--no-async-scheduling"; fi;
-        exec /usr/local/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
-        --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
+        exec /usr/local/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+        --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}
         --host ${VLLM_HOST:-127.0.0.1}
         --port ${VLLM_PORT:-8888}
         --trust-remote-code
@@ -135,8 +141,10 @@ services:
         --kv-cache-dtype nvfp4_ds_mla
         --block-size 256
         --max-model-len ${MAX_MODEL_LEN:-1048576}
-        --max-num-seqs ${MAX_NUM_SEQS:-6}
+        --max-num-seqs ${MAX_NUM_SEQS:-4}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
+        --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-2048}
+        --scheduling-policy ${SCHEDULING_POLICY:-priority}
         --max-cudagraph-capture-size "$${CUDAGRAPH_CAPTURE_SIZE}"
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         ${ENFORCE_EAGER:+--enforce-eager}
