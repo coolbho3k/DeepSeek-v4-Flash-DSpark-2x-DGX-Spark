@@ -46,6 +46,16 @@ cfg = SimpleNamespace(
     speculative_config=None,
 )
 
+os.environ.pop("VLLM_DSV4_DEMAND_SIZED_KV_POOLS", None)
+default_groups = get_kv_cache_groups(cfg, make_specs())
+assert len(default_groups) == 2
+assert all(
+    isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    for group in default_groups
+)
+assert default_groups[0].kv_cache_spec.get_page_sizes() == [27072]
+assert default_groups[1].kv_cache_spec.get_page_sizes() == [32832]
+
 os.environ["VLLM_DSV4_DEMAND_SIZED_KV_POOLS"] = "1"
 demand_groups = get_kv_cache_groups(cfg, make_specs())
 assert len(demand_groups) == 2

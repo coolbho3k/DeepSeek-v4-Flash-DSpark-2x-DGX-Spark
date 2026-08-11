@@ -1,10 +1,10 @@
-"""Install opt-in demand-sized DeepSeek V4 KV cache pools.
+"""Install default-enabled demand-sized DeepSeek V4 KV cache pools.
 
 This accuracy-neutral allocator keeps every per-layer dtype and kernel layout,
 but gives each DeepSeek cache group an independent local block-ID namespace
 and a physical backing sized for that group's worst-case request demand.
 
-Enable with VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1.
+Disable with VLLM_DSV4_DEMAND_SIZED_KV_POOLS=0.
 """
 
 from pathlib import Path
@@ -64,7 +64,7 @@ replace(
 
 
 def _demand_sized_kv_pools_enabled() -> bool:
-    return os.environ.get("VLLM_DSV4_DEMAND_SIZED_KV_POOLS", "0") == "1"
+    return os.environ.get("VLLM_DSV4_DEMAND_SIZED_KV_POOLS", "1") == "1"
 
 
 def _use_demand_sized_kv_pools(
@@ -813,7 +813,7 @@ replace(
     """    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
 """,
     """    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
-    VLLM_DSV4_DEMAND_SIZED_KV_POOLS: bool = False
+    VLLM_DSV4_DEMAND_SIZED_KV_POOLS: bool = True
 """,
 )
 
@@ -831,7 +831,7 @@ replace(
         else None
     ),
     "VLLM_DSV4_DEMAND_SIZED_KV_POOLS": lambda: os.getenv(
-        "VLLM_DSV4_DEMAND_SIZED_KV_POOLS", "0"
+        "VLLM_DSV4_DEMAND_SIZED_KV_POOLS", "1"
     ) == "1",
 """,
 )
@@ -863,4 +863,4 @@ replace(
 )
 
 
-print("Opt-in DeepSeek V4 demand-sized KV pool patches applied")
+print("Default-enabled DeepSeek V4 demand-sized KV pool patches applied")

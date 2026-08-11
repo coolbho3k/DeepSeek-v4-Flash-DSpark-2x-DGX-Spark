@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only checks for the opt-in demand-sized DeepSeek KV pool patch."""
+"""CPU-only checks for the default-enabled demand-sized KV pool patch."""
 
 from types import SimpleNamespace
 

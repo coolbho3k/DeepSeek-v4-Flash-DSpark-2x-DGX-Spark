@@ -181,7 +181,7 @@ case "$USE_FP4_INDEXER_CACHE" in
     exit 2
     ;;
 esac
-VLLM_DSV4_DEMAND_SIZED_KV_POOLS="${VLLM_DSV4_DEMAND_SIZED_KV_POOLS:-0}"
+VLLM_DSV4_DEMAND_SIZED_KV_POOLS="${VLLM_DSV4_DEMAND_SIZED_KV_POOLS:-1}"
 case "$VLLM_DSV4_DEMAND_SIZED_KV_POOLS" in
   0|1) ;;
   *)
@@ -515,7 +515,7 @@ print_resolved_profile() {
     echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
   fi
   echo "  MXFP4 indexer cache: $USE_FP4_INDEXER_CACHE"
-  echo "  demand-sized KV pools: $VLLM_DSV4_DEMAND_SIZED_KV_POOLS (experimental)"
+  echo "  demand-sized KV pools: $VLLM_DSV4_DEMAND_SIZED_KV_POOLS (default; 0 disables)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
     echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ))"

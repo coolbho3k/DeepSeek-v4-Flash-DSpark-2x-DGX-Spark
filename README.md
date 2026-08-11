@@ -64,12 +64,12 @@ instead of reserving the legacy 132-byte FP8 envelope. The public profile sets
 reduces the packed allocator stride from 928,128 to 842,112 bytes per shared
 block: 9.27% fewer cache bytes, or 10.21% more blocks at matched KV memory.
 
-The Anemll 416 image also contains an opt-in, accuracy-neutral demand-sized
-allocator. Set `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1` to give each DeepSeek cache
-group its own physical backing and local block-ID namespace at that group's
-actual page stride. This removes cross-group page padding without changing the
-416-byte NVFP4 or 68-byte MXFP4 records, cache writers, attention kernels, or
-model numerics. On this cluster at `GPU_MEMORY_UTILIZATION=0.80`, repeated live
+The Anemll 416 image also contains a default-enabled, accuracy-neutral
+demand-sized allocator. It gives each DeepSeek cache group its own physical
+backing and local block-ID namespace at that group's actual page stride. This
+removes cross-group page padding without changing the 416-byte NVFP4 or 68-byte
+MXFP4 records, cache writers, attention kernels, or model numerics. On this
+cluster at `GPU_MEMORY_UTILIZATION=0.80`, repeated live
 boots reported 2.82M-2.91M usable KV tokens (the spread reflects available
 unified memory at profiling time), approximately 54% more token slots per
 available KV GiB than the shared padded allocator.
@@ -78,9 +78,9 @@ Paired warmed 768-input/2048-output DSpark runs measured 83.99 and 82.63 tok/s
 with demand-sized pools versus 79.55 and 77.75 tok/s with the flag off. Treat
 that modest increase as run-to-run performance evidence, not a guaranteed
 speedup; the allocator's primary benefit is capacity. A four-session
-768-input/512-output test completed at 160.9 aggregate tok/s. The mode remains
-opt-in while KV-transfer connectors and external block-ID eviction are
-unsupported.
+768-input/512-output test completed at 160.9 aggregate tok/s. Set
+`VLLM_DSV4_DEMAND_SIZED_KV_POOLS=0` before using KV-transfer connectors or
+external block-ID eviction, which still require the legacy shared namespace.
 
 > [!NOTE]
 > Capacity figures captured earlier in this README are retained as historical
@@ -113,6 +113,7 @@ logic ships inside the image rather than as a host bind-mount.
 - `scheduling_policy=priority`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `USE_FP4_INDEXER_CACHE=1`
+- `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
 - `DEFAULT_THINKING=max` (`off`, `low`, `high`, or `max`; request-level overrides still win)
@@ -142,10 +143,11 @@ This repo documents the validated 0731 1M NVFP4 agent profile, historical
 preview / Stage-C checkpoints, and the optimized runtime built from Anemll:
 
 - PR #14 benchmark checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
-- default `max_model_len=1048576` (1M), `max_num_seqs=4`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
+- default `max_model_len=1048576` (1M), `max_num_seqs=4`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`,
+  `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
 - default image `vllm-dspark-runtime:anemll-nvfp4-416-experimental`; the
-  conservative util=0.80 MXFP4-indexer validation reported 1,881,719 compact
-  KV token slots (1.79x the 1M per-request ceiling)
+  conservative util=0.80 demand-pool validation reported 2.82M-2.91M compact
+  KV token slots (2.69x-2.78x the 1M per-request ceiling)
 - 0731 is text-only; pair with a multimodal sidecar when image input is required
 - 900K acceptance + concurrency/prefill sweep published under `results/`
 - historical Stage-C C12 pool: `3,225,280 tokens`
@@ -183,7 +185,8 @@ Runtime:
 - recipe defaults: `max_model_len=1048576`, `max_num_seqs=4`,
   `max_num_batched_tokens=8192`, `long_prefill_token_threshold=2048`,
   `scheduling_policy=priority`, `gpu_memory_utilization=0.80`,
-  `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`
+  `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
+  `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - compose installs checkpoint `encoding/encoding_dsv4.py` into vLLM on both ranks
   (override with `DSPARK_ENCODING_FILE` when needed)
@@ -737,7 +740,7 @@ usage terms.
 | `recipe/vllm/v1/spec_decode/dspark_proposer.py` | Stage-C/proposer reference; start script may sync to worker |
 | `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C/D NVFP4 image layers for local builds |
 | `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | fused 416-byte writers and direct native sparse-attention dispatch |
-| `recipe/nvfp4/patch-demand-sized-kv-pools.py` | opt-in per-group physical KV pools and scheduler block namespaces |
+| `recipe/nvfp4/patch-demand-sized-kv-pools.py` | default-enabled per-group physical KV pools and scheduler block namespaces |
 | `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
 | `scripts/test-demand-sized-kv-pools.py` | demand-pool planner, capacity, admission, allocation, and free checks |
 | `scripts/test-demand-sized-kv-grouping.py` | page-grouping compatibility with the demand-pool flag on and off |
@@ -834,6 +837,7 @@ recipe default):
 - `SCHEDULING_POLICY=priority`
 - `GPU_MEMORY_UTILIZATION=0.80`
 - `MTP_NUM_TOKENS=5`
+- `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
 - `DEFAULT_THINKING=max`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
 - `HF_HUB_OFFLINE=1` after both nodes have a full model cache
@@ -1122,6 +1126,7 @@ blaming the DSpark weights.
   `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8192`,
   `LONG_PREFILL_TOKEN_THRESHOLD=2048`, `SCHEDULING_POLICY=priority`,
   `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
+  `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
   `DSPARK_VLLM_IMAGE=vllm-dspark-runtime:anemll-nvfp4-416-experimental`,
   `DSPARK_BUILD_STAGE=anemll-416`,
