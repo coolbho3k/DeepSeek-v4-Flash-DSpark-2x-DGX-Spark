@@ -173,7 +173,15 @@ case "$DEFAULT_THINKING" in
     exit 2
     ;;
 esac
-export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING
+USE_FP4_INDEXER_CACHE="${USE_FP4_INDEXER_CACHE:-1}"
+case "$USE_FP4_INDEXER_CACHE" in
+  0|1) ;;
+  *)
+    echo "USE_FP4_INDEXER_CACHE must be 0 or 1 (got: $USE_FP4_INDEXER_CACHE)" >&2
+    exit 2
+    ;;
+esac
+export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING USE_FP4_INDEXER_CACHE
 
 # A wildcard is valid for binding but not a useful health-check destination.
 API_HOST="${API_HOST:-$VLLM_HOST}"
@@ -498,6 +506,7 @@ print_resolved_profile() {
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
     echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
   fi
+  echo "  MXFP4 indexer cache: $USE_FP4_INDEXER_CACHE"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   if [ "${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then
     echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ))"

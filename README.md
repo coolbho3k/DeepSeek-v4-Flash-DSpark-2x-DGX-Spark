@@ -57,6 +57,18 @@ scratch buffers, and CUDA graphs. Keep `ENFORCE_EAGER` empty, use
 handling is built into the Anemll 416 image, so it does not require the
 historical Stage-C runtime override.
 
+The same image can also store the 128-wide Lightning Indexer cache in its
+native 68-byte MXFP4 layout (64 packed E2M1 bytes plus four UE8M0 scale bytes)
+instead of reserving the legacy 132-byte FP8 envelope. The public profile sets
+`USE_FP4_INDEXER_CACHE=1`; set it to `0` for a same-image FP8-indexer A/B. This
+reduces the packed allocator stride from 928,128 to 842,112 bytes per shared
+block: 9.27% fewer cache bytes, or 10.21% more blocks at matched KV memory.
+
+> [!NOTE]
+> Capacity figures captured earlier in this README are retained as historical
+> raw logs. Builds before the mixed-page accounting fix over-reported equivalent
+> tokens; compare allocator bytes or use a newly built image for current capacity.
+
 This repo still vendors Keys' DSpark concurrency patch and Stage-C overlay
 sources for local image builds and documentation. With the Anemll image, that
 logic ships inside the image rather than as a host bind-mount.
@@ -82,6 +94,7 @@ logic ships inside the image rather than as a host bind-mount.
 - `long_prefill_token_threshold=2048`
 - `scheduling_policy=priority`
 - `kv_cache_dtype=nvfp4_ds_mla`
+- `USE_FP4_INDEXER_CACHE=1`
 - `gpu_memory_utilization=0.80`
 - `MTP_NUM_TOKENS=5` (checkpoint `dspark_block_size` is 5; k must be ≥ 5)
 - `DEFAULT_THINKING=max` (`off`, `low`, `high`, or `max`; request-level overrides still win)
@@ -113,7 +126,8 @@ preview / Stage-C checkpoints, and the optimized runtime built from Anemll:
 - PR #14 benchmark checkpoint `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`
 - default `max_model_len=1048576` (1M), `max_num_seqs=4`, `kv_cache_dtype=nvfp4_ds_mla`, `MTP_NUM_TOKENS=5`
 - default image `vllm-dspark-runtime:anemll-nvfp4-416-experimental`; the
-  conservative util=0.78 validation allocated 1,699,136 compact KV token slots
+  conservative util=0.80 MXFP4-indexer validation reported 1,881,719 compact
+  KV token slots (1.79x the 1M per-request ceiling)
 - 0731 is text-only; pair with a multimodal sidecar when image input is required
 - 900K acceptance + concurrency/prefill sweep published under `results/`
 - historical Stage-C C12 pool: `3,225,280 tokens`
@@ -528,7 +542,7 @@ Three independent knobs, often confused:
 
 | knob | what it is | this build |
 | --- | --- | --- |
-| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | 2,779,464 tokens on the current optimized 416-byte image at util 0.835; capacity varies with util, graph coverage, and image |
+| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | 1,881,719 tokens in the validated 416-byte + MXFP4-indexer profile at util 0.80 (1.79x 1M); capacity varies with util, graph coverage, and image |
 | `max_model_len` | per-request **ceiling** — how long any one request may grow | **1,048,576 (1M)** default |
 | `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | **4** default |
 
@@ -546,16 +560,17 @@ Worked examples at the 1M ceiling / 4 slots:
 ```
 4 requests x  50k tokens =  200k   fits easily
 4 requests x 200k tokens =  800k   fits easily
-4 requests x 500k tokens =  2.0M   fits the current pool, with limited headroom
-2 requests x 1M   tokens =  2.0M   fits the current pool
+4 requests x 400k tokens =  1.6M   fits the validated util=0.80 pool
+2 requests x 1M   tokens =  2.0M   exceeds the validated util=0.80 pool
 4 requests x 1M   tokens =  4.0M   impossible — excess requests queue/preempt
 ```
 
-The boot log's `Maximum concurrency for 1,048,576 tokens per request: 2.65x`
-(0731 on this cluster) only means a few *simultaneous full-1M*
-requests fit. Agent turns are almost never near 1M, so four normal-length
-sessions share the pool while the 1M ceiling stays available for the rare long
-one. That is exactly why `1M + max_num_seqs=4` is useful: you are not
+The validated boot log reports
+`Maximum concurrency for 1,048,576 tokens per request: 1.79x`: one full-1M
+request plus substantial additional live context fits at util 0.80. Agent turns
+are almost never near 1M, so four normal-length sessions share the pool while
+the 1M ceiling remains available for a rare long request. That is exactly why
+`1M + max_num_seqs=4` is useful: you are not
 reserving 4×1M, you are sharing one pool across short requests under a high
 ceiling.
 

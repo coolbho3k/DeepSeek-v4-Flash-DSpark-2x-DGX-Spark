@@ -71,6 +71,56 @@ replace(
 ''',
 )
 
+
+# The Anemll indexer already writes MXFP4: 64 packed E2M1 code bytes plus four
+# UE8M0 scale bytes for a 128-wide row. Upstream nevertheless declares the old
+# 132-byte FP8 envelope, so vLLM allocates almost twice the storage the kernels
+# can address. Advertise the physical 68-byte record instead.
+replace(
+    "models/deepseek_v4/attention.py",
+    """        # NOTE(yifan): FP8 indxer cache use the same layout as V3.2:
+        # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
+        # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
+        # but only use the first half of the memory.
+        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+""",
+    """        # The MXFP4 writer stores two E2M1 values per byte and one UE8M0
+        # scale per 32 values: 128 // 2 + 128 // 32 = 68 bytes. Keep the
+        # legacy 132-byte envelope only for the FP8 indexer path.
+        k_cache_head_dim = (
+            self.head_dim // 2 + self.head_dim // 32
+            if self.use_fp4_kv
+            else self.head_dim + self.head_dim // self.quant_block_size * 4
+        )
+""",
+)
+
+# Anemll's vendored DeepGEMM carries dedicated SM120 FP4 MQA and paged-MQA
+# kernels, but this vLLM snapshot still rejects consumer Blackwell before the
+# dispatcher can select them. Permit the architecture family that the image
+# explicitly implements; keep the fail-closed check for older GPUs.
+replace(
+    "v1/attention/backends/mla/indexer.py",
+    """        assert (
+            current_platform.is_device_capability_family(100)
+            or not self.use_fp4_indexer_cache
+        ), (
+            "use_fp4_indexer_cache requires Blackwell datacenter GPUs "
+            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
+            "earlier architectures are not supported."
+        )
+""",
+    """        assert (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+            or not self.use_fp4_indexer_cache
+        ), (
+            "use_fp4_indexer_cache requires a Blackwell GPU with a packaged "
+            "FP4 MQA implementation (sm_10x or sm_12x)."
+        )
+""",
+)
+
 replace(
     "models/deepseek_v4/compressor.py",
     '''        if self.head_dim == 512:
@@ -100,7 +150,7 @@ replace(
                 compress_norm_rope_store_cutedsl,
             )
 ''',
-    '''        if self.use_fp4_cache:
+    '''        if self.use_fp4_cache and self.head_dim == 512:
             from .nvidia.nvfp4_cache import (
                 compress_norm_rope_store_nvfp4_416,
             )
@@ -262,6 +312,58 @@ replace(
                 return self.storage_block_size * 416
             # DeepseekV4 fp8_ds_mla: 448B NoPE + 128B RoPE + 8B scale.
             return self.storage_block_size * 584
+''',
+)
+
+# Packed DeepSeek V4 groups share one scheduler block pool, but each group has
+# its own page size. The legacy estimator divides every group's byte demand by
+# the full-MLA page size, which becomes wrong as soon as actual page sizes are
+# retained. Count the blocks each group can consume instead; this matches the
+# coordinator's shared BlockPool accounting and affects reporting only.
+replace(
+    "v1/core/kv_cache_utils.py",
+    '''    num_layer_per_group = max(
+        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    )
+    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
+        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
+    )
+    memory_per_block = (
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        * num_layer_per_group
+    )
+    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
+    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    return max_concurrency
+''',
+    '''    if _use_packed_kv_cache_config(
+        vllm_config, kv_cache_config.kv_cache_groups
+    ):
+        # All managers allocate from one shared BlockPool. Each cache group
+        # therefore contributes its own worst-case block demand regardless of
+        # the physical byte width of that group's packed page.
+        num_blocks_per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
+        return kv_cache_config.num_blocks / num_blocks_per_request
+
+    num_layer_per_group = max(
+        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    )
+    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
+        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
+    )
+    memory_per_block = (
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        * num_layer_per_group
+    )
+    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
+    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    return max_concurrency
 ''',
 )
 

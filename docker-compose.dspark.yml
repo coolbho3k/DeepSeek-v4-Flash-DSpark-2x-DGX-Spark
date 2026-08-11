@@ -92,6 +92,7 @@ services:
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
       ENABLE_DSPARK_SPECULATION: "${ENABLE_DSPARK_SPECULATION:-1}"
       DSV4_NVFP4_ATTENTION_MODE: "${DSV4_NVFP4_ATTENTION_MODE:-auto}"
+      USE_FP4_INDEXER_CACHE: "${USE_FP4_INDEXER_CACHE:-1}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-max}"
       ASYNC_SCHEDULING: "${ASYNC_SCHEDULING:-1}"
       LONG_PREFILL_TOKEN_THRESHOLD: "${LONG_PREFILL_TOKEN_THRESHOLD:-2048}"
@@ -119,6 +120,8 @@ services:
         SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
         SPECULATIVE_ARGS=();
         if [ "$${ENABLE_DSPARK_SPECULATION:-1}" = "1" ]; then SPECULATIVE_ARGS=(--speculative-config "$${SPECULATIVE_CONFIG}"); fi;
+        FP4_INDEXER_ARGS=();
+        if [ "$${USE_FP4_INDEXER_CACHE:-1}" = "1" ]; then FP4_INDEXER_ARGS=(--attention-config '{"use_fp4_indexer_cache":true}'); fi;
         CUDAGRAPH_CAPTURE_SIZE=$$(( ${MAX_NUM_SEQS:-4} * (${MTP_NUM_TOKENS:-5} + 1) ));
         if [ "$${ENABLE_DSPARK_SPECULATION:-1}" = "0" ]; then CUDAGRAPH_CAPTURE_SIZE=${MAX_NUM_SEQS:-4}; fi;
         case "$${DEFAULT_THINKING:-max}" in
@@ -153,6 +156,7 @@ services:
         $${ASYNC_SCHEDULING_ARGS}
         --enable-chunked-prefill
         "$${SPECULATIVE_ARGS[@]}"
+        "$${FP4_INDEXER_ARGS[@]}"
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
         --moe-backend ${MOE_BACKEND:-flashinfer_b12x}

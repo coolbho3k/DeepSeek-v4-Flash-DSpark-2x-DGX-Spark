@@ -55,8 +55,12 @@ def cpu_reference_test() -> None:
 
 def hybrid_allocator_geometry_test() -> None:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
-    from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_uniform_groups
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_groups_uniform_groups,
+        get_max_concurrency_for_kv_cache_config,
+    )
     from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
         KVQuantMode,
         MLAAttentionSpec,
         SlidingWindowMLASpec,
@@ -87,6 +91,19 @@ def hybrid_allocator_geometry_test() -> None:
             sliding_window=window,
             alignment=576,
         )
+
+    indexer_fp4_record_bytes = 128 // 2 + 128 // 32
+    assert indexer_fp4_record_bytes == 68
+    indexer_fp4 = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=indexer_fp4_record_bytes,
+        dtype=torch.uint8,
+        alignment=512,
+        compress_ratio=4,
+    )
+    assert indexer_fp4.real_page_size_bytes == 4352
+    assert indexer_fp4.page_size_bytes == 4608
 
     full_specs = UniformTypeKVCacheSpecs.from_specs(
         {
@@ -126,6 +143,32 @@ def hybrid_allocator_geometry_test() -> None:
         [full_specs, swa_specs, state_c4_specs, state_c128_specs]  # type: ignore[list-item]
     )
     assert grouped
+    fake_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
+        kv_transfer_config=None,
+    )
+    cache_config = KVCacheConfig(
+        num_blocks=10_000,
+        kv_cache_tensors=[],
+        kv_cache_groups=grouped,
+    )
+    expected_blocks_per_request = sum(
+        (
+            group.kv_cache_spec.max_memory_usage_bytes(fake_config)
+            + group.kv_cache_spec.page_size_bytes
+            - 1
+        )
+        // group.kv_cache_spec.page_size_bytes
+        for group in grouped
+    )
+    assert get_max_concurrency_for_kv_cache_config(
+        fake_config, cache_config
+    ) == 10_000 / expected_blocks_per_request
     assert max(full_specs.get_page_sizes()) == 32832  # type: ignore[union-attr]
     assert DeepseekSparseSWABackend.get_kv_cache_shape(
         2, 64, 1, HEAD_DIM, "nvfp4_ds_mla"
@@ -138,6 +181,174 @@ def gpu_kernel_test() -> None:
         raise SystemExit("CUDA is required for --gpu")
 
     device = torch.device("cuda")
+
+    # The production indexer writer uses a planar page: 64 packed E2M1 bytes
+    # per token followed by four UE8M0 scale bytes per token. Exercise the last
+    # slot of a 64-row storage page and guard the first byte beyond 4,352.
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        kv_cache_as_quant_view,
+    )
+    from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+        compress_norm_rope_store_triton,
+    )
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_mqa_logits,
+        fp8_fp4_paged_mqa_logits,
+        get_paged_mqa_logits_metadata,
+    )
+
+    indexer_head_dim = 128
+    indexer_record_bytes = indexer_head_dim // 2 + indexer_head_dim // 32
+    indexer_storage_block = 64
+    indexer_page_bytes = indexer_storage_block * indexer_record_bytes
+    assert (indexer_record_bytes, indexer_page_bytes) == (68, 4352)
+
+    indexer_generator = torch.Generator(device=device).manual_seed(68)
+    indexer_state_block = 4
+    indexer_position = 255
+    indexer_state = torch.randn(
+        (64, indexer_state_block, 4 * indexer_head_dim),
+        generator=indexer_generator,
+        dtype=torch.float32,
+        device=device,
+    )
+    indexer_backing = torch.zeros(
+        indexer_page_bytes + 64, dtype=torch.uint8, device=device
+    )
+    indexer_backing[indexer_page_bytes:].fill_(0xA5)
+    indexer_cache = indexer_backing[:indexer_page_bytes].view(
+        1, indexer_storage_block, indexer_record_bytes
+    )
+    indexer_positions = torch.tensor(
+        [indexer_position], dtype=torch.int64, device=device
+    )
+    indexer_slots = torch.tensor(
+        [indexer_position], dtype=torch.int64, device=device
+    )
+    indexer_kv_slots = torch.tensor(
+        [indexer_storage_block - 1], dtype=torch.int64, device=device
+    )
+    indexer_block_table = torch.arange(
+        64, dtype=torch.int32, device=device
+    ).view(1, -1)
+    indexer_cos_sin = torch.zeros(
+        (256, 64), dtype=torch.float32, device=device
+    )
+    indexer_cos_sin[:, :32] = 1.0
+
+    compress_norm_rope_store_triton(
+        state_cache=indexer_state,
+        num_actual=1,
+        token_to_req_indices=torch.zeros(1, dtype=torch.int32, device=device),
+        positions=indexer_positions,
+        slot_mapping=indexer_slots,
+        block_table=indexer_block_table,
+        block_size=indexer_state_block,
+        state_width=2 * indexer_head_dim,
+        cos_sin_cache=indexer_cos_sin,
+        kv_cache=indexer_cache,
+        k_cache_metadata=SimpleNamespace(slot_mapping=indexer_kv_slots),
+        pdl_kwargs={"launch_pdl": False},
+        head_dim=indexer_head_dim,
+        rope_head_dim=64,
+        compress_ratio=4,
+        overlap=True,
+        use_fp4_cache=True,
+        rms_norm_weight=torch.ones(
+            indexer_head_dim, dtype=torch.float32, device=device
+        ),
+        rms_norm_eps=1e-6,
+        quant_block=32,
+        token_stride=indexer_head_dim // 2,
+        scale_dim=indexer_head_dim // 32,
+    )
+    indexer_quant_view = kv_cache_as_quant_view(
+        indexer_cache, indexer_head_dim, True
+    )
+    assert indexer_quant_view.shape == (1, 64, 1, 68)
+    assert torch.any(
+        indexer_backing[(indexer_storage_block - 1) * 64 : 4096] != 0
+    )
+    indexer_last_scale = 64 * 64 + (indexer_storage_block - 1) * 4
+    assert torch.any(indexer_backing[indexer_last_scale:indexer_page_bytes] != 0)
+    assert torch.all(indexer_backing[indexer_page_bytes:] == 0xA5)
+    print("gpu compact 68-byte MXFP4 indexer page boundary: ok")
+
+    # This Anemll image vendors SM120 implementations even though its vLLM
+    # snapshot's generic metadata builder originally rejected consumer
+    # Blackwell. Launch both production FP4 score kernels with tiny tensors so
+    # the guard relaxation cannot silently outlive the packaged implementation.
+    indexer_heads = 64
+    num_queries = 2
+    flat_kv_tokens = 64
+    q_packed = torch.zeros(
+        (num_queries, indexer_heads, indexer_head_dim // 2),
+        dtype=torch.int8,
+        device=device,
+    )
+    q_scales = torch.zeros(
+        (num_queries, indexer_heads), dtype=torch.int32, device=device
+    )
+    flat_k_packed = torch.zeros(
+        (flat_kv_tokens, indexer_head_dim // 2),
+        dtype=torch.int8,
+        device=device,
+    )
+    flat_k_scales = torch.zeros(
+        (flat_kv_tokens,), dtype=torch.int32, device=device
+    )
+    indexer_weights = torch.zeros(
+        (num_queries, indexer_heads), dtype=torch.float32, device=device
+    )
+    flat_starts = torch.zeros(num_queries, dtype=torch.int32, device=device)
+    flat_ends = torch.full(
+        (num_queries,), flat_kv_tokens, dtype=torch.int32, device=device
+    )
+    flat_logits = fp8_fp4_mqa_logits(
+        (q_packed, q_scales),
+        (flat_k_packed, flat_k_scales),
+        indexer_weights,
+        flat_starts,
+        flat_ends,
+        clean_logits=False,
+    )
+    assert flat_logits.shape == (num_queries, flat_kv_tokens)
+    assert torch.isfinite(flat_logits).all()
+
+    decode_q = q_packed[:1].view(
+        1, 1, indexer_heads, indexer_head_dim // 2
+    )
+    decode_q_scales = q_scales[:1].view(1, 1, indexer_heads)
+    paged_kv = torch.zeros(
+        (1, indexer_storage_block, 1, indexer_record_bytes),
+        dtype=torch.uint8,
+        device=device,
+    )
+    decode_weights = indexer_weights[:1]
+    context_lens = torch.full(
+        (1, 1), indexer_storage_block, dtype=torch.int32, device=device
+    )
+    decode_block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    schedule = get_paged_mqa_logits_metadata(
+        context_lens,
+        indexer_storage_block,
+        torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    decode_logits = fp8_fp4_paged_mqa_logits(
+        (decode_q, decode_q_scales),
+        paged_kv,
+        decode_weights,
+        context_lens,
+        decode_block_table,
+        schedule,
+        indexer_storage_block,
+        clean_logits=False,
+    )
+    torch.cuda.synchronize(device)
+    assert decode_logits.shape == (1, indexer_storage_block)
+    assert torch.isfinite(decode_logits).all()
+    print("gpu SM120 MXFP4 indexer prefill/decode logits: ok")
+
     values = make_values(8, device)
 
     # Anemll vLLM 0.25 fuses C4 compression into its legacy cache writer and
