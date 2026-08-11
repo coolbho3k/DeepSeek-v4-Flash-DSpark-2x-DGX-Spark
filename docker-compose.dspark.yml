@@ -96,7 +96,8 @@ services:
       VLLM_DSV4_DEMAND_SIZED_KV_POOLS: "${VLLM_DSV4_DEMAND_SIZED_KV_POOLS:-1}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-max}"
       ASYNC_SCHEDULING: "${ASYNC_SCHEDULING:-1}"
-      LONG_PREFILL_TOKEN_THRESHOLD: "${LONG_PREFILL_TOKEN_THRESHOLD:-2048}"
+      LONG_PREFILL_TOKEN_THRESHOLD: "${LONG_PREFILL_TOKEN_THRESHOLD:-512}"
+      VLLM_PREFILL_DECODE_CADENCE: "${VLLM_PREFILL_DECODE_CADENCE:-16}"
       SCHEDULING_POLICY: "${SCHEDULING_POLICY:-priority}"
 
     command:
@@ -147,7 +148,7 @@ services:
         --max-model-len ${MAX_MODEL_LEN:-1048576}
         --max-num-seqs ${MAX_NUM_SEQS:-4}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8208}
-        --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-2048}
+        --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-512}
         --scheduling-policy ${SCHEDULING_POLICY:-priority}
         --max-cudagraph-capture-size "$${CUDAGRAPH_CAPTURE_SIZE}"
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}

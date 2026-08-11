@@ -109,7 +109,8 @@ logic ships inside the image rather than as a host bind-mount.
 - `max_model_len=1048576` (**1M** — keep this as the documented default)
 - `max_num_seqs=4`
 - `max_num_batched_tokens=8208` (8192 scheduled target tokens plus 16 DSpark draft slots)
-- `long_prefill_token_threshold=2048`
+- `long_prefill_token_threshold=512`
+- `VLLM_PREFILL_DECODE_CADENCE=16` (one prefill-bearing iteration per 16 scheduler iterations while decode is active; `1` disables)
 - `scheduling_policy=priority`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - `USE_FP4_INDEXER_CACHE=1`
@@ -183,8 +184,8 @@ Runtime:
 - served model name: `deepseek-v4-flash-0731`
 - `kv_cache_dtype=nvfp4_ds_mla`
 - recipe defaults: `max_model_len=1048576`, `max_num_seqs=4`,
-  `max_num_batched_tokens=8208`, `long_prefill_token_threshold=2048`,
-  `scheduling_policy=priority`, `gpu_memory_utilization=0.80`,
+  `max_num_batched_tokens=8208`, `long_prefill_token_threshold=512`,
+  `VLLM_PREFILL_DECODE_CADENCE=16`, `scheduling_policy=priority`, `gpu_memory_utilization=0.80`,
   `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
   `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`
 - `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
@@ -741,8 +742,10 @@ usage terms.
 | `recipe/nvfp4/Dockerfile.stage-*` | Stage A/B/C/D NVFP4 image layers for local builds |
 | `recipe/overlay/vllm/models/deepseek_v4/nvidia/nvfp4_cache.py` | fused 416-byte writers and direct native sparse-attention dispatch |
 | `recipe/nvfp4/patch-demand-sized-kv-pools.py` | default-enabled per-group physical KV pools and scheduler block namespaces |
+| `recipe/nvfp4/patch-prefill-decode-cadence.py` | decode-first prefill cadence for ordinary single-engine/TP serving |
 | `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
 | `scripts/test-demand-sized-kv-pools.py` | demand-pool planner, capacity, admission, allocation, and free checks |
+| `scripts/test-prefill-decode-cadence.py` | CPU cadence release/throttle pattern checks |
 | `scripts/test-demand-sized-kv-grouping.py` | page-grouping compatibility with the demand-pool flag on and off |
 | `scripts/test-demand-sized-kv-v2-allocator.py` | V2 backing-storage aliasing and pool-isolation checks |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
@@ -765,9 +768,11 @@ vLLM or FlashInfer release. Keep these constraints in mind:
 - Previously unseen attention, MoE, or prefill shapes can trigger multi-minute
   JIT compilation. The persistent Triton and TileLang cache paths prevent the
   same compilation from recurring after the first successful run.
-- The 2048-token long-prefill cap mitigates interactive starvation, but it is a
-  static vLLM scheduler limit rather than full compute-fair scheduling. A huge
-  prefill can still reduce decode throughput for another live request.
+- The 512-token long-prefill cap is paired with a decode-first cadence. While
+  decode is active, the default admits one prefill-bearing iteration per 16
+  scheduler iterations; set `VLLM_PREFILL_DECODE_CADENCE=1` for upstream mixed
+  scheduling. Cadence improves interactivity by deliberately slowing background
+  prefill only while both workloads coexist.
 - Start at `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark uses unified memory, so a
   value that is stable on one pair can put another pair under host-memory
   pressure.
@@ -833,7 +838,8 @@ recipe default):
 - `MAX_MODEL_LEN=1048576` (**1M**)
 - `MAX_NUM_SEQS=4`
 - `MAX_NUM_BATCHED_TOKENS=8208`
-- `LONG_PREFILL_TOKEN_THRESHOLD=2048`
+- `LONG_PREFILL_TOKEN_THRESHOLD=512`
+- `VLLM_PREFILL_DECODE_CADENCE=16`
 - `SCHEDULING_POLICY=priority`
 - `GPU_MEMORY_UTILIZATION=0.80`
 - `MTP_NUM_TOKENS=5`
@@ -1007,7 +1013,8 @@ Core vLLM flags (from `docker-compose.dspark.yml`):
 - `--max-model-len 1048576` (**default 1M**)
 - `--max-num-seqs 4`
 - `--max-num-batched-tokens 8208`
-- `--long-prefill-token-threshold 2048`
+- `--long-prefill-token-threshold 512`
+- `VLLM_PREFILL_DECODE_CADENCE=16` (runtime environment)
 - `--scheduling-policy priority`
 - requested `--max-cudagraph-capture-size 24`
   (`max_num_seqs * (MTP_NUM_TOKENS + 1)` → `4 * 6`; exactly supported by Anemll vLLM 0.25
@@ -1025,7 +1032,8 @@ Key runtime env:
 - `DSPARK_BUILD_STAGE=anemll-416`
 - `DSV4_NVFP4_ATTENTION_MODE=auto`
 - `DEFAULT_THINKING=max`
-- `LONG_PREFILL_TOKEN_THRESHOLD=2048`
+- `LONG_PREFILL_TOKEN_THRESHOLD=512`
+- `VLLM_PREFILL_DECODE_CADENCE=16`
 - `SCHEDULING_POLICY=priority`
 - empty `ENFORCE_EAGER` (CUDA graphs enabled)
 - `HF_HUB_OFFLINE=1` when hub caches are complete on both nodes
@@ -1124,7 +1132,8 @@ blaming the DSpark weights.
 - The **default** agent-serving profile is `DSPARK_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731`,
   `SERVED_MODEL_NAME=deepseek-v4-flash-0731`,
   `MAX_MODEL_LEN=1048576` (1M), `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8208`,
-  `LONG_PREFILL_TOKEN_THRESHOLD=2048`, `SCHEDULING_POLICY=priority`,
+  `LONG_PREFILL_TOKEN_THRESHOLD=512`, `VLLM_PREFILL_DECODE_CADENCE=16`,
+  `SCHEDULING_POLICY=priority`,
   `GPU_MEMORY_UTILIZATION=0.80`, `MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=max`,
   `VLLM_DSV4_DEMAND_SIZED_KV_POOLS=1`,
   `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
