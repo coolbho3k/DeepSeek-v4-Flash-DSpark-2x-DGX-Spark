@@ -3,7 +3,9 @@
 VLLM_PREFILL_DECODE_CADENCE=1 preserves upstream scheduling. Values greater
 than one admit prefill compute once per N scheduler iterations while at least
 one decode request is running. The scheduler's existing throttle_prefills path
-still allows unrestricted prefill when no decode request is active.
+still allows unrestricted prefill when no decode request is active. In that
+pure-prefill case, the configured long-prefill threshold is expanded to a fair
+share of the complete scheduler token budget.
 """
 
 from pathlib import Path
@@ -66,16 +68,85 @@ import vllm.envs as envs
 
 replace(
     "v1/core/sched/scheduler.py",
+    """logger = init_logger(__name__)
+
+
+class Scheduler(SchedulerInterface):
+""",
+    """logger = init_logger(__name__)
+
+
+def _get_prefill_token_threshold(
+    configured_threshold: int,
+    max_num_scheduled_tokens: int,
+    interactive_cadence: bool,
+    has_active_decode: bool,
+    num_prefill_candidates: int,
+) -> int:
+    \"\"\"Return the per-request prefill cap for this scheduler step.\"\"\"
+    if (
+        configured_threshold <= 0
+        or not interactive_cadence
+        or has_active_decode
+    ):
+        return configured_threshold
+
+    fair_share = max_num_scheduled_tokens // max(1, num_prefill_candidates)
+    return max(configured_threshold, fair_share)
+
+
+class Scheduler(SchedulerInterface):
+""",
+)
+
+replace(
+    "v1/core/sched/scheduler.py",
     """        defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 """,
     """        interactive_cadence = envs.VLLM_PREFILL_DECODE_CADENCE > 1
+        has_active_decode = any(
+            not request.is_prefill_chunk for request in self.running
+        )
+        num_prefill_candidates = min(
+            self.max_num_running_reqs,
+            sum(request.is_prefill_chunk for request in self.running)
+            + len(self.waiting)
+            + len(self.skipped_waiting),
+        )
+        prefill_token_threshold = _get_prefill_token_threshold(
+            self.scheduler_config.long_prefill_token_threshold,
+            self.max_num_scheduled_tokens,
+            interactive_cadence,
+            has_active_decode,
+            num_prefill_candidates,
+        )
         defer_prefills = (
             throttle_prefills
             and (interactive_cadence or not self.prefill_capacity_bound)
-            and any(not r.is_prefill_chunk for r in self.running)
+            and has_active_decode
         )
+""",
+)
+
+replace(
+    "v1/core/sched/scheduler.py",
+    """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+""",
+    """            if 0 < prefill_token_threshold < num_new_tokens:
+                num_new_tokens = prefill_token_threshold
+""",
+)
+
+replace(
+    "v1/core/sched/scheduler.py",
+    """                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+""",
+    """                    threshold = prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
 """,
 )
 

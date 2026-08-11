@@ -770,9 +770,12 @@ vLLM or FlashInfer release. Keep these constraints in mind:
   same compilation from recurring after the first successful run.
 - The 512-token long-prefill cap is paired with a decode-first cadence. While
   decode is active, the default admits one prefill-bearing iteration per 16
-  scheduler iterations; set `VLLM_PREFILL_DECODE_CADENCE=1` for upstream mixed
-  scheduling. Cadence improves interactivity by deliberately slowing background
-  prefill only while both workloads coexist.
+  scheduler iterations. With no active decoder, the scheduler instead divides
+  its complete 8192-target-token budget fairly across active prefills (8192 for
+  one, 4096 each for two, and 2048 each for four). Set
+  `VLLM_PREFILL_DECODE_CADENCE=1` for upstream scheduling. Cadence improves
+  interactivity by deliberately slowing background prefill only while both
+  workloads coexist.
 - Start at `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark uses unified memory, so a
   value that is stable on one pair can put another pair under host-memory
   pressure.
