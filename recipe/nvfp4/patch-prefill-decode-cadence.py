@@ -4,8 +4,8 @@ VLLM_PREFILL_DECODE_CADENCE=1 preserves upstream scheduling. Values greater
 than one admit prefill compute once per N scheduler iterations while at least
 one decode request is running. The scheduler's existing throttle_prefills path
 still allows unrestricted prefill when no decode request is active. In that
-pure-prefill case, the configured long-prefill threshold is expanded to a fair
-share of the complete scheduler token budget.
+pure-prefill case, requests sequentially water-fill the complete scheduler
+budget. Mixed iterations instead share one global configured prefill budget.
 """
 
 from pathlib import Path
@@ -78,21 +78,16 @@ class Scheduler(SchedulerInterface):
 
 def _get_prefill_token_threshold(
     configured_threshold: int,
-    max_num_scheduled_tokens: int,
+    prefill_token_budget: int,
     interactive_cadence: bool,
-    has_active_decode: bool,
-    num_prefill_candidates: int,
+    num_remaining_prefills: int,
 ) -> int:
-    \"\"\"Return the per-request prefill cap for this scheduler step.\"\"\"
-    if (
-        configured_threshold <= 0
-        or not interactive_cadence
-        or has_active_decode
-    ):
+    \"\"\"Return this request's remainder-aware prefill cap.\"\"\"
+    if not interactive_cadence:
         return configured_threshold
 
-    fair_share = max_num_scheduled_tokens // max(1, num_prefill_candidates)
-    return max(configured_threshold, fair_share)
+    remaining = max(1, num_remaining_prefills)
+    return (prefill_token_budget + remaining - 1) // remaining
 
 
 class Scheduler(SchedulerInterface):
@@ -115,13 +110,13 @@ replace(
             + len(self.waiting)
             + len(self.skipped_waiting),
         )
-        prefill_token_threshold = _get_prefill_token_threshold(
-            self.scheduler_config.long_prefill_token_threshold,
-            self.max_num_scheduled_tokens,
-            interactive_cadence,
-            has_active_decode,
-            num_prefill_candidates,
+        configured_prefill_threshold = (
+            self.scheduler_config.long_prefill_token_threshold
         )
+        prefill_token_budget = self.max_num_scheduled_tokens
+        if has_active_decode and configured_prefill_threshold > 0:
+            prefill_token_budget = configured_prefill_threshold
+        num_remaining_prefills = num_prefill_candidates
         defer_prefills = (
             throttle_prefills
             and (interactive_cadence or not self.prefill_capacity_bound)
@@ -135,20 +130,144 @@ replace(
     """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 """,
-    """            if 0 < prefill_token_threshold < num_new_tokens:
-                num_new_tokens = prefill_token_threshold
+    """            threshold = configured_prefill_threshold
+            if request.is_prefill_chunk:
+                threshold = _get_prefill_token_threshold(
+                    configured_prefill_threshold,
+                    prefill_token_budget,
+                    interactive_cadence,
+                    num_remaining_prefills,
+                )
+                if interactive_cadence:
+                    num_remaining_prefills = max(0, num_remaining_prefills - 1)
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
 """,
 )
 
 replace(
     "v1/core/sched/scheduler.py",
-    """                    threshold = self.scheduler_config.long_prefill_token_threshold
+    """                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens > 0
+                    num_new_tokens = 0
+                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                    # DP prefill balancing: defer this step's local prefill
+                    # compute to a cadence-aligned step.
+                    break
+                else:
+                    # Number of tokens to be scheduled.
+                    # We use `request.num_tokens` instead of
+                    # `request.num_prompt_tokens` to consider the resumed
+                    # requests, which have output tokens.
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+
+                    # Pad new decode requests to uniform spec decoding size to
+                    # preserve full cudagraph for this step.
+                    if (
+                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        and num_new_tokens == 1
+                        and (scheduled_running_reqs and not prefill_scheduled)
+                    ):
+                        num_new_tokens = 1 + self.num_spec_tokens
+                        if (
+                            num_new_tokens > token_budget
+                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                        ):
+                            # Prefer to not schedule than schedule un-padded here.
+                            break
+                        pad_spec_decode = True
+
+                    threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
 """,
-    """                    threshold = prefill_token_threshold
+    """                is_waiting_prefill = (
+                    num_computed_tokens < request.num_tokens - 1
+                )
+
+                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens > 0
+                    num_new_tokens = 0
+                    if interactive_cadence and is_waiting_prefill:
+                        num_remaining_prefills = max(
+                            0, num_remaining_prefills - 1
+                        )
+                elif defer_prefills and is_waiting_prefill:
+                    # DP prefill balancing: defer this step's local prefill
+                    # compute to a cadence-aligned step.
+                    break
+                else:
+                    # Number of tokens to be scheduled.
+                    # We use `request.num_tokens` instead of
+                    # `request.num_prompt_tokens` to consider the resumed
+                    # requests, which have output tokens.
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+
+                    # Pad new decode requests to uniform spec decoding size to
+                    # preserve full cudagraph for this step.
+                    if (
+                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        and num_new_tokens == 1
+                        and (scheduled_running_reqs and not prefill_scheduled)
+                    ):
+                        num_new_tokens = 1 + self.num_spec_tokens
+                        if (
+                            num_new_tokens > token_budget
+                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                        ):
+                            # Prefer to not schedule than schedule un-padded here.
+                            break
+                        pad_spec_decode = True
+
+                    threshold = configured_prefill_threshold
+                    if is_waiting_prefill:
+                        threshold = _get_prefill_token_threshold(
+                            configured_prefill_threshold,
+                            prefill_token_budget,
+                            interactive_cadence,
+                            num_remaining_prefills,
+                        )
+                        if interactive_cadence:
+                            num_remaining_prefills = max(
+                                0, num_remaining_prefills - 1
+                            )
                     if 0 < threshold < num_new_tokens:
 """,
 )
+
+replace(
+    "v1/core/sched/scheduler.py",
+    """            num_scheduled_tokens[request_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            req_index += 1
+""",
+    """            num_scheduled_tokens[request_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            if interactive_cadence and request.is_prefill_chunk:
+                prefill_token_budget = max(
+                    0, prefill_token_budget - num_new_tokens
+                )
+            req_index += 1
+""",
+)
+
+replace(
+    "v1/core/sched/scheduler.py",
+    """                num_scheduled_tokens[request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = RequestStatus.RUNNING
+""",
+    """                num_scheduled_tokens[request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                if interactive_cadence and is_waiting_prefill:
+                    prefill_token_budget = max(
+                        0, prefill_token_budget - num_new_tokens
+                    )
+                request.status = RequestStatus.RUNNING
+""",
+)
+
 
 
 # Capture and validate the cadence after the scheduler has been constructed.

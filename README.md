@@ -768,14 +768,16 @@ vLLM or FlashInfer release. Keep these constraints in mind:
 - Previously unseen attention, MoE, or prefill shapes can trigger multi-minute
   JIT compilation. The persistent Triton and TileLang cache paths prevent the
   same compilation from recurring after the first successful run.
-- The 512-token long-prefill cap is paired with a decode-first cadence. While
-  decode is active, the default admits one prefill-bearing iteration per 16
-  scheduler iterations. With no active decoder, the scheduler instead divides
-  its complete 8192-target-token budget fairly across active prefills (8192 for
-  one, 4096 each for two, and 2048 each for four). Set
-  `VLLM_PREFILL_DECODE_CADENCE=1` for upstream scheduling. Cadence improves
-  interactivity by deliberately slowing background prefill only while both
-  workloads coexist.
+- A global 512-token mixed-prefill budget is paired with a decode-first
+  cadence. While decode is active, the default admits one prefill-bearing
+  iteration per 16 scheduler iterations and water-fills those 512 tokens across
+  every active prefill. With no active decoder, the scheduler water-fills its
+  complete 8192-target-token budget instead: three streams receive
+  2731/2731/2730, five receive 1639/1639/1638/1638/1638, and unused shares from
+  earlier short requests are redistributed to the remaining streams. `MAX_NUM_SEQS=4` still limits this profile
+  to four running requests; excess requests wait, while the same allocator
+  scales automatically if that limit is raised. Set
+  `VLLM_PREFILL_DECODE_CADENCE=1` for upstream scheduling.
 - Start at `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark uses unified memory, so a
   value that is stable on one pair can put another pair under host-memory
   pressure.
