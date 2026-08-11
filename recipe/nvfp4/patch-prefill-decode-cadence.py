@@ -2,10 +2,10 @@
 
 VLLM_PREFILL_DECODE_CADENCE=1 preserves upstream scheduling. Values greater
 than one admit prefill compute once per N scheduler iterations while at least
-one decode request is running. The scheduler's existing throttle_prefills path
-still allows unrestricted prefill when no decode request is active. In that
-pure-prefill case, requests sequentially water-fill the complete scheduler
-budget. Mixed iterations instead share one global configured prefill budget.
+one decode request is running. Pure-prefill batches use a larger aggregate
+budget that tapers with existing context, preserving throughput while bounding
+the duration of a single model step. Once decode is active, competing prefills
+share the configured long-prefill threshold.
 """
 
 from pathlib import Path
@@ -76,18 +76,79 @@ class Scheduler(SchedulerInterface):
     """logger = init_logger(__name__)
 
 
+_LONE_PREFILL_WORK_TARGET_CONTEXT_TOKENS = 1 << 16
+_CONTENDED_PREFILL_WORK_TARGET_CONTEXT_TOKENS = 1 << 18
+_CONTENDED_PREFILL_MIN_BUDGET_MULTIPLIER = 4
+
+
+def _get_prefill_token_budget(
+    configured_threshold: int,
+    max_scheduled_tokens: int,
+    interactive_cadence: bool,
+    has_active_decode: bool,
+    num_prefill_candidates: int,
+    max_prefill_context_tokens: int = 0,
+) -> int:
+    \"\"\"Return the global prefill budget for this scheduler iteration.\"\"\"
+    if not interactive_cadence or configured_threshold <= 0:
+        return max_scheduled_tokens
+    if has_active_decode:
+        return min(configured_threshold, max_scheduled_tokens)
+    if num_prefill_candidates <= 1:
+        return max_scheduled_tokens
+
+    # Several pure prefills can use a large batch while their contexts are
+    # short. Taper the aggregate query-token budget as attention work grows,
+    # but retain four configured-threshold chunks of forward progress. With
+    # the default 8192/512 profile this yields 8192 through 256K context, then
+    # 4096 at 512K and 2048 at 1M.
+    context_tokens = max(
+        _CONTENDED_PREFILL_WORK_TARGET_CONTEXT_TOKENS,
+        max_prefill_context_tokens,
+    )
+    context_budget = (
+        max_scheduled_tokens * _CONTENDED_PREFILL_WORK_TARGET_CONTEXT_TOKENS
+        + context_tokens
+        - 1
+    ) // context_tokens
+    min_budget = min(
+        max_scheduled_tokens,
+        configured_threshold * _CONTENDED_PREFILL_MIN_BUDGET_MULTIPLIER,
+    )
+    return min(max_scheduled_tokens, max(min_budget, context_budget))
+
+
 def _get_prefill_token_threshold(
     configured_threshold: int,
     prefill_token_budget: int,
     interactive_cadence: bool,
     num_remaining_prefills: int,
+    num_computed_tokens: int = 0,
+    apply_context_cap: bool = True,
 ) -> int:
-    \"\"\"Return this request's remainder-aware prefill cap.\"\"\"
+    \"\"\"Return this request's fair, context-aware prefill cap.\"\"\"
     if not interactive_cadence:
         return configured_threshold
 
     remaining = max(1, num_remaining_prefills)
-    return (prefill_token_budget + remaining - 1) // remaining
+    fair_share = (prefill_token_budget + remaining - 1) // remaining
+    if (
+        not apply_context_cap
+        or configured_threshold <= 0
+        or num_computed_tokens <= _LONE_PREFILL_WORK_TARGET_CONTEXT_TOKENS
+    ):
+        return fair_share
+
+    # Bound roughly query_tokens * existing_context_tokens for a lone prefill.
+    # At the default 8192/512 budgets this yields 8192 through 64K context,
+    # then 4096/2048/1024/512 at 128K/256K/512K/1M respectively.
+    context_cap = (
+        prefill_token_budget * _LONE_PREFILL_WORK_TARGET_CONTEXT_TOKENS
+        + num_computed_tokens
+        - 1
+    ) // num_computed_tokens
+    context_cap = max(configured_threshold, context_cap)
+    return min(fair_share, context_cap)
 
 
 class Scheduler(SchedulerInterface):
@@ -110,12 +171,35 @@ replace(
             + len(self.waiting)
             + len(self.skipped_waiting),
         )
+        running_prefill_contexts = [
+            request.num_computed_tokens
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        waiting_slots = max(0, self.max_num_running_reqs - len(self.running))
+        waiting_prefill_contexts = [
+            request.num_computed_tokens or request.num_prompt_tokens
+            for request_queue in (self.waiting, self.skipped_waiting)
+            for request in itertools.islice(request_queue, waiting_slots)
+        ]
+        max_prefill_context_tokens = max(
+            running_prefill_contexts + waiting_prefill_contexts,
+            default=0,
+        )
         configured_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold
         )
-        prefill_token_budget = self.max_num_scheduled_tokens
-        if has_active_decode and configured_prefill_threshold > 0:
-            prefill_token_budget = configured_prefill_threshold
+        prefill_token_budget = _get_prefill_token_budget(
+            configured_prefill_threshold,
+            self.max_num_scheduled_tokens,
+            interactive_cadence,
+            has_active_decode,
+            num_prefill_candidates,
+            max_prefill_context_tokens,
+        )
+        apply_lone_prefill_context_cap = (
+            not has_active_decode and num_prefill_candidates <= 1
+        )
         num_remaining_prefills = num_prefill_candidates
         defer_prefills = (
             throttle_prefills
@@ -137,6 +221,8 @@ replace(
                     prefill_token_budget,
                     interactive_cadence,
                     num_remaining_prefills,
+                    request.num_computed_tokens,
+                    apply_lone_prefill_context_cap,
                 )
                 if interactive_cadence:
                     num_remaining_prefills = max(0, num_remaining_prefills - 1)
@@ -227,6 +313,8 @@ replace(
                             prefill_token_budget,
                             interactive_cadence,
                             num_remaining_prefills,
+                            num_computed_tokens,
+                            apply_lone_prefill_context_cap,
                         )
                         if interactive_cadence:
                             num_remaining_prefills = max(

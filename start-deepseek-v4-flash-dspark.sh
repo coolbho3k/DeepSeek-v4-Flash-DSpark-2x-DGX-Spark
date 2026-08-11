@@ -516,7 +516,7 @@ print_resolved_profile() {
   echo "  max model len: ${MAX_MODEL_LEN:-1048576}"
   echo "  max num seqs: ${MAX_NUM_SEQS:-4}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8208}"
-  echo "  global mixed prefill budget: $LONG_PREFILL_TOKEN_THRESHOLD (0 disables; pure prefill water-fills the full budget)"
+  echo "  mixed prefill budget: $LONG_PREFILL_TOKEN_THRESHOLD (0 disables; pure prefill scales with context)"
   echo "  prefill/decode cadence: $VLLM_PREFILL_DECODE_CADENCE (1 disables)"
   echo "  scheduling policy: $SCHEDULING_POLICY"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"

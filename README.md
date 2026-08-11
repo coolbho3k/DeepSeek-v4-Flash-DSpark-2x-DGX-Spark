@@ -745,7 +745,7 @@ usage terms.
 | `recipe/nvfp4/patch-prefill-decode-cadence.py` | decode-first prefill cadence for ordinary single-engine/TP serving |
 | `scripts/test-nvfp4-ds-mla-416.py` | CPU layout plus GPU boundary/round-trip/attention checks |
 | `scripts/test-demand-sized-kv-pools.py` | demand-pool planner, capacity, admission, allocation, and free checks |
-| `scripts/test-prefill-decode-cadence.py` | CPU cadence release/throttle pattern checks |
+| `scripts/test-prefill-decode-cadence.py` | CPU cadence, contention-budget, and context-scaling checks |
 | `scripts/test-demand-sized-kv-grouping.py` | page-grouping compatibility with the demand-pool flag on and off |
 | `scripts/test-demand-sized-kv-v2-allocator.py` | V2 backing-storage aliasing and pool-isolation checks |
 | `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
@@ -768,15 +768,16 @@ vLLM or FlashInfer release. Keep these constraints in mind:
 - Previously unseen attention, MoE, or prefill shapes can trigger multi-minute
   JIT compilation. The persistent Triton and TileLang cache paths prevent the
   same compilation from recurring after the first successful run.
-- A global 512-token mixed-prefill budget is paired with a decode-first
-  cadence. While decode is active, the default admits one prefill-bearing
-  iteration per 16 scheduler iterations and water-fills those 512 tokens across
-  every active prefill. With no active decoder, the scheduler water-fills its
-  complete 8192-target-token budget instead: three streams receive
-  2731/2731/2730, five receive 1639/1639/1638/1638/1638, and unused shares from
-  earlier short requests are redistributed to the remaining streams. `MAX_NUM_SEQS=4` still limits this profile
-  to four running requests; excess requests wait, while the same allocator
-  scales automatically if that limit is raised. Set
+- A global 512-token mixed-prefill budget is paired with a decode-first cadence.
+  While decode is active, the default admits one prefill-bearing iteration per
+  16 scheduler iterations and water-fills those 512 tokens across every active
+  prefill. With no active decoder, competing prefills share an adaptive
+  aggregate budget: 8192 tokens through 256K context, then approximately 4096
+  at 512K and 2048 at 1M. A lone prefill retains the complete
+  8192-target-token budget through 64K existing context, then scales
+  approximately to 4096/2048/1024/512 tokens at 128K/256K/512K/1M context.
+  Unused fair shares are redistributed to later requests. `MAX_NUM_SEQS=4`
+  still limits this profile to four running requests; excess requests wait. Set
   `VLLM_PREFILL_DECODE_CADENCE=1` for upstream scheduling.
 - Start at `GPU_MEMORY_UTILIZATION=0.80`. DGX Spark uses unified memory, so a
   value that is stable on one pair can put another pair under host-memory
