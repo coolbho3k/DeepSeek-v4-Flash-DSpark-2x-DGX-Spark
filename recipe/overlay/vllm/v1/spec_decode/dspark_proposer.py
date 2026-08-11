@@ -55,6 +55,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self.target_hidden_size = hf_config.hidden_size * len(
             hf_config.dspark_target_layer_ids
         )
+        self.vocab_size = int(hf_config.vocab_size)
         self.noise_token_id = int(hf_config.dspark_noise_token_id)
         self._prefilled = False
         self._runner = runner
@@ -482,7 +483,22 @@ class DSparkProposer(SpecDecodeBaseProposer):
     ) -> None:
         batch_size = input_ids.shape[0]
         self._draft_graph_batch_size = padded_batch_size
-        self._draft_input_ids_buffer[:batch_size].copy_(input_ids.to(torch.long))
+        input_ids = input_ids.to(torch.long)
+        # Padded speculative rejection uses -1 for tokens after the first
+        # rejection. With async scheduling, that placeholder can be the
+        # sampled-token row presented to the next DSpark proposal. It must not
+        # reach either VocabParallelEmbedding or the replicated Markov
+        # nn.Embedding inside the captured draft graph: CUDA embedding/index
+        # select asserts are fatal to the whole worker. A noise token is the
+        # checkpoint-defined neutral draft input; any resulting bad proposal
+        # is rejected by target verification and cannot change output.
+        valid_input_ids = (input_ids >= 0) & (input_ids < self.vocab_size)
+        safe_input_ids = torch.where(
+            valid_input_ids,
+            input_ids,
+            self.noise_token_id,
+        )
+        self._draft_input_ids_buffer[:batch_size].copy_(safe_input_ids)
         self._draft_hidden_buffer[:batch_size].copy_(hidden_states.to(self.dtype))
         self._draft_positions_buffer[:batch_size].copy_(positions.to(torch.long))
         if slot_index is None:
@@ -805,6 +821,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
                     batch_size,
                 )
                 self._nonuniform_step_warned = True
+            self._last_draft_lengths = [0] * batch_size
             return next_token_ids.new_zeros(
                 (batch_size, self.num_speculative_tokens)
             )

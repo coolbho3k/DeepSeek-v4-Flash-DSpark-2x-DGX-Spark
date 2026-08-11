@@ -15,10 +15,10 @@ if [ -n "${THIS_NODE_HF_CACHE:-}" ]; then
   HF_CACHE="$THIS_NODE_HF_CACHE"
 fi
 
-: "${DSPARK_MODEL:=deepseek-ai/DeepSeek-V4-Flash-DSpark}"
+: "${DSPARK_MODEL:=deepseek-ai/DeepSeek-V4-Flash-0731}"
 : "${HF_CACHE:=$HOME/.cache/huggingface}"
 : "${HF_DOWNLOAD_WORKERS:=1}"
-: "${DSPARK_VLLM_IMAGE:=vllm-dspark-runtime:dspark-nvfp4-stage-c}"
+: "${DSPARK_VLLM_IMAGE:=vllm-dspark-runtime:anemll-nvfp4-416-experimental}"
 # Anemll image ships python at /usr/bin/python3 (Stage-C used /opt/env/bin/python).
 : "${IMAGE_PYTHON:=/usr/bin/python3}"
 

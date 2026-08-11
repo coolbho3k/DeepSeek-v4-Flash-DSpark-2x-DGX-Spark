@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Publish the optimized Anemll 416-byte NVFP4 image as the feature-branch default build and direct-Compose target.
+- Standardize the 1M agent profile on `MAX_NUM_SEQS=4`, MTP5, capture size 24, `LONG_PREFILL_TOKEN_THRESHOLD=2048`, priority scheduling, and conservative `GPU_MEMORY_UTILIZATION=0.80`.
+- Persist Triton and TileLang JIT caches under each node-local Hugging Face cache mount.
+- Align build, model-cache preparation, validation, launcher, and smoke-test fallbacks with `DeepSeek-V4-Flash-0731`.
+- Add a clone-first forum-preview quick start, current 2,779,464-token boot evidence, and explicit experimental limitations.
+
 - **Raise `DEFAULT_THINKING` from `low` to `max`** in `.env.dspark.example`, enabling full reasoning effort by default. Request-level overrides still take precedence.
 - Make `deepseek-ai/DeepSeek-V4-Flash-0731` the default checkpoint for the two-Spark 1M profile.
 - Document the 0731 encoding, parser, and vision boundaries.

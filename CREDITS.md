@@ -77,7 +77,7 @@ bind-mounted `dspark_proposer.py`.
 ## MiaAI-Lab Contribution
 
 MiaAI-Lab maintains this fork's validated 2x DGX Spark NVFP4-KV recipe, Stage
-A/B/C runtime packaging, sanitized two-node launch flow, Keys concurrency patch
+A/B/C/D runtime packaging, sanitized two-node launch flow, Keys concurrency patch
 integration, runtime proposer bind-mount, and benchmark artifacts from the
 validated runs.
 

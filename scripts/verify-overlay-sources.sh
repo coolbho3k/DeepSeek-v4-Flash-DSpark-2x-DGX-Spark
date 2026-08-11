@@ -20,4 +20,12 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
+overlay_proposer="$CONTEXT_DIR/vllm/v1/spec_decode/dspark_proposer.py"
+launcher_proposer="$REPO_DIR/recipe/vllm/v1/spec_decode/dspark_proposer.py"
+if [ -f "$overlay_proposer" ] && [ -f "$launcher_proposer" ] \
+  && ! cmp -s "$overlay_proposer" "$launcher_proposer"; then
+  echo "DSpark proposer copies have drifted: $overlay_proposer != $launcher_proposer" >&2
+  exit 1
+fi
+
 echo "Overlay source check passed for $DOCKERFILE"

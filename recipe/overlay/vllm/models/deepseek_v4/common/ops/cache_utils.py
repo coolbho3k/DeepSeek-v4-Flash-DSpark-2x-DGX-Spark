@@ -372,6 +372,22 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
+    if k_cache.shape[-1] == 416:
+        from vllm.models.deepseek_v4.nvidia.nvfp4_cache import (
+            dequantize_and_gather_nvfp4_416,
+        )
+
+        dequantize_and_gather_nvfp4_416(
+            out,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
+        )
+        return
+
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops import (
