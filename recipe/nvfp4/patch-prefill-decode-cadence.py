@@ -118,6 +118,36 @@ def _get_prefill_token_budget(
     return min(max_scheduled_tokens, max(min_budget, context_budget))
 
 
+def _get_prefill_context_tokens(request, kv_cache_manager, has_mamba_connector):
+    \"\"\"Return KV context already computed or locally available for a prefill.\"\"\"
+    if (
+        request.num_computed_tokens > 0
+        or not kv_cache_manager.enable_caching
+        or request.skip_reading_prefix_cache
+    ):
+        return request.num_computed_tokens
+
+    # Fresh and preempted requests do not receive their local prefix-cache hit
+    # count until the waiting loop below. Probe the coordinator directly so the
+    # aggregate work budget sees actual available KV without recording the same
+    # prefix-cache lookup twice or pretending the uncomputed prompt is context.
+    max_cache_hit_length = request.num_tokens - 1
+    if has_mamba_connector:
+        _, per_group_hits = (
+            kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
+                request.block_hashes,
+                max_cache_hit_length,
+            )
+        )
+        return max(per_group_hits, default=0)
+
+    _, num_computed_tokens = kv_cache_manager.coordinator.find_longest_cache_hit(
+        request.block_hashes,
+        max_cache_hit_length,
+    )
+    return num_computed_tokens
+
+
 def _get_prefill_token_threshold(
     configured_threshold: int,
     prefill_token_budget: int,
@@ -177,11 +207,19 @@ replace(
             if request.is_prefill_chunk
         ]
         waiting_slots = max(0, self.max_num_running_reqs - len(self.running))
-        waiting_prefill_contexts = [
-            request.num_computed_tokens or request.num_prompt_tokens
-            for request_queue in (self.waiting, self.skipped_waiting)
-            for request in itertools.islice(request_queue, waiting_slots)
-        ]
+        waiting_prefill_contexts = (
+            [
+                _get_prefill_context_tokens(
+                    request,
+                    self.kv_cache_manager,
+                    self.connector is not None and self.has_mamba_layers,
+                )
+                for request_queue in (self.waiting, self.skipped_waiting)
+                for request in itertools.islice(request_queue, waiting_slots)
+            ]
+            if interactive_cadence and not has_active_decode
+            else []
+        )
         max_prefill_context_tokens = max(
             running_prefill_contexts + waiting_prefill_contexts,
             default=0,
